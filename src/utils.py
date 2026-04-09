@@ -11,8 +11,17 @@ import openai
 import re
 import time
 
-# Load OpenAI API key for embeddings
+# ── OpenAI client ──
 openai.api_key = os.getenv("OPENAI_API_KEY")
+EMBEDDING_DIM = 1536  # OpenAI text-embedding-3-small dimension
+
+# ── Ollama (local) client — uncomment to switch back to Ollama ──
+# ollama_client = OpenAI(
+#     base_url="http://localhost:11434/v1",
+#     api_key="ollama",
+# )
+# OLLAMA_EMBEDDING_MODEL = "llama3.2:3b"
+# EMBEDDING_DIM = 3072  # llama3.2:3b embedding dimension
 
 def get_supabase_client() -> Client:
     """
@@ -47,10 +56,16 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     
     for retry in range(max_retries):
         try:
+            # ── OpenAI embeddings ──
             response = openai.embeddings.create(
-                model="text-embedding-3-small", # Hardcoding embedding model for now, will change this later to be more dynamic
+                model="text-embedding-3-small",
                 input=texts
             )
+            # ── Ollama embeddings — uncomment to switch to Ollama ──
+            # response = ollama_client.embeddings.create(
+            #     model=OLLAMA_EMBEDDING_MODEL,
+            #     input=texts
+            # )
             return [item.embedding for item in response.data]
         except Exception as e:
             if retry < max_retries - 1:
@@ -67,16 +82,22 @@ def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
                 
                 for i, text in enumerate(texts):
                     try:
+                        # ── OpenAI fallback ──
                         individual_response = openai.embeddings.create(
                             model="text-embedding-3-small",
                             input=[text]
                         )
+                        # ── Ollama fallback — uncomment to switch to Ollama ──
+                        # individual_response = ollama_client.embeddings.create(
+                        #     model=OLLAMA_EMBEDDING_MODEL,
+                        #     input=[text]
+                        # )
                         embeddings.append(individual_response.data[0].embedding)
                         successful_count += 1
                     except Exception as individual_error:
                         print(f"Failed to create embedding for text {i}: {individual_error}")
                         # Add zero embedding as fallback
-                        embeddings.append([0.0] * 1536)
+                        embeddings.append([0.0] * EMBEDDING_DIM)  # OpenAI: 1536, llama3.2:3b: 3072
                 
                 print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
                 return embeddings
@@ -93,11 +114,11 @@ def create_embedding(text: str) -> List[float]:
     """
     try:
         embeddings = create_embeddings_batch([text])
-        return embeddings[0] if embeddings else [0.0] * 1536
+        return embeddings[0] if embeddings else [0.0] * EMBEDDING_DIM  # OpenAI: 1536, llama3.2:3b: 3072
     except Exception as e:
         print(f"Error creating embedding: {e}")
         # Return empty embedding if there's an error
-        return [0.0] * 1536
+        return [0.0] * EMBEDDING_DIM  # OpenAI: 1536, llama3.2:3b: 3072
 
 def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, bool]:
     """
@@ -112,12 +133,12 @@ def generate_contextual_embedding(full_document: str, chunk: str) -> Tuple[str, 
         - The contextual text that situates the chunk within the document
         - Boolean indicating if contextual embedding was performed
     """
-    model_choice = os.getenv("MODEL_CHOICE")
-    
+    # model_choice = os.getenv("MODEL_CHOICE")  # Uncomment when switching back to OpenAI
+
     try:
         # Create the prompt for generating contextual information
-        prompt = f"""<document> 
-{full_document[:25000]} 
+        prompt = f"""<document>
+{full_document[:25000]}
 </document>
 Here is the chunk we want to situate within the whole document 
 <chunk> 
@@ -125,9 +146,9 @@ Here is the chunk we want to situate within the whole document
 </chunk> 
 Please give a short succinct context to situate this chunk within the overall document for the purposes of improving search retrieval of the chunk. Answer only with the succinct context and nothing else."""
 
-        # Call the OpenAI API to generate contextual information
+        # ── OpenAI LLM call ──
         response = openai.chat.completions.create(
-            model=model_choice,
+            model=os.getenv("MODEL_CHOICE", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise contextual information."},
                 {"role": "user", "content": prompt}
@@ -135,6 +156,13 @@ Please give a short succinct context to situate this chunk within the overall do
             temperature=0.3,
             max_tokens=200
         )
+        # ── Ollama LLM call — uncomment to switch to Ollama ──
+        # response = ollama_client.chat.completions.create(
+        #     model=OLLAMA_EMBEDDING_MODEL,
+        #     messages=[...],
+        #     temperature=0.3,
+        #     max_tokens=200
+        # )
         
         # Extract the generated context
         context = response.choices[0].message.content.strip()
@@ -449,8 +477,8 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
     Returns:
         A summary of what the code example demonstrates
     """
-    model_choice = os.getenv("MODEL_CHOICE")
-    
+    # model_choice = os.getenv("MODEL_CHOICE")  # Uncomment when switching back to OpenAI
+
     # Create the prompt
     prompt = f"""<context_before>
 {context_before[-500:] if len(context_before) > 500 else context_before}
@@ -466,10 +494,11 @@ def generate_code_example_summary(code: str, context_before: str, context_after:
 
 Based on the code example and its surrounding context, provide a concise summary (2-3 sentences) that describes what this code example demonstrates and its purpose. Focus on the practical application and key concepts illustrated.
 """
-    
+
     try:
+        # ── OpenAI LLM call ──
         response = openai.chat.completions.create(
-            model=model_choice,
+            model=os.getenv("MODEL_CHOICE", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise code example summaries."},
                 {"role": "user", "content": prompt}
@@ -477,9 +506,13 @@ Based on the code example and its surrounding context, provide a concise summary
             temperature=0.3,
             max_tokens=100
         )
-        
+        # ── Ollama LLM call — uncomment to switch to Ollama ──
+        # response = ollama_client.chat.completions.create(
+        #     model=OLLAMA_EMBEDDING_MODEL, ...
+        # )
+
         return response.choices[0].message.content.strip()
-    
+
     except Exception as e:
         print(f"Error generating code example summary: {e}")
         return "Code example for demonstration purposes."
@@ -648,11 +681,11 @@ def extract_source_summary(source_id: str, content: str, max_length: int = 500) 
         return default_summary
     
     # Get the model choice from environment variables
-    model_choice = os.getenv("MODEL_CHOICE")
-    
+    # model_choice = os.getenv("MODEL_CHOICE")  # Uncomment when switching back to OpenAI
+
     # Limit content length to avoid token limits
     truncated_content = content[:25000] if len(content) > 25000 else content
-    
+
     # Create the prompt for generating the summary
     prompt = f"""<source_content>
 {truncated_content}
@@ -660,11 +693,11 @@ def extract_source_summary(source_id: str, content: str, max_length: int = 500) 
 
 The above content is from the documentation for '{source_id}'. Please provide a concise summary (3-5 sentences) that describes what this library/tool/framework is about. The summary should help understand what the library/tool/framework accomplishes and the purpose.
 """
-    
+
     try:
-        # Call the OpenAI API to generate the summary
+        # ── OpenAI LLM call ──
         response = openai.chat.completions.create(
-            model=model_choice,
+            model=os.getenv("MODEL_CHOICE", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": "You are a helpful assistant that provides concise library/tool/framework summaries."},
                 {"role": "user", "content": prompt}
@@ -672,6 +705,10 @@ The above content is from the documentation for '{source_id}'. Please provide a 
             temperature=0.3,
             max_tokens=150
         )
+        # ── Ollama LLM call — uncomment to switch to Ollama ──
+        # response = ollama_client.chat.completions.create(
+        #     model=OLLAMA_EMBEDDING_MODEL, ...
+        # )
         
         # Extract the generated summary
         summary = response.choices[0].message.content.strip()

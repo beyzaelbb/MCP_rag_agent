@@ -1,455 +1,397 @@
-<h1 align="center">Crawl4AI RAG MCP Server</h1>
+# Crawl4AI RAG Workspace
 
-<p align="center">
-  <em>Web Crawling and RAG Capabilities for AI Agents and AI Coding Assistants</em>
-</p>
+This repository implements a document crawling and retrieval system built around [Crawl4AI](https://crawl4ai.com), [Supabase](https://supabase.com/), [OpenAI](https://platform.openai.com/), and optional [Neo4j](https://neo4j.com/).
 
-A powerful implementation of the [Model Context Protocol (MCP)](https://modelcontextprotocol.io) integrated with [Crawl4AI](https://crawl4ai.com) and [Supabase](https://supabase.com/) for providing AI agents and AI coding assistants with advanced web crawling and RAG capabilities.
+It currently exposes the same core knowledge base through three different interfaces:
 
-With this MCP server, you can <b>scrape anything</b> and then <b>use that knowledge anywhere</b> for RAG.
+- An MCP server for AI agents and coding assistants
+- An OpenAI-compatible chat API with built-in crawl-and-index behavior
+- A Streamlit frontend for managing sources and chatting with the indexed knowledge base
 
-The primary goal is to bring this MCP server into [Archon](https://github.com/coleam00/Archon) as I evolve it to be more of a knowledge engine for AI coding assistants to build AI agents. This first version of the Crawl4AI/RAG MCP server will be improved upon greatly soon, especially making it more configurable so you can use different embedding models and run everything locally with Ollama.
+It also includes an optional knowledge graph pipeline for parsing Python repositories into Neo4j and checking AI-generated scripts for hallucinated imports, classes, methods, or usage patterns.
 
-Consider this GitHub repository a testbed, hence why I haven't been super actively address issues and pull requests yet. I certainly will though as I bring this into Archon V2!
+## What The Project Does
 
-## Overview
+At a high level, the project:
 
-This MCP server provides tools that enable AI agents to crawl websites, store content in a vector database (Supabase), and perform RAG over the crawled content. It follows the best practices for building MCP servers based on the [Mem0 MCP server template](https://github.com/coleam00/mcp-mem0/) I provided on my channel previously.
+1. Crawls web pages, sitemaps, text files, and recursively discovered internal links
+2. Chunks the extracted content and stores it in Supabase with vector embeddings
+3. Lets users and agents retrieve relevant content through RAG
+4. Optionally extracts large code examples into a separate searchable index
+5. Optionally parses Python repositories into Neo4j for repository-aware code validation
 
-The server includes several advanced RAG strategies that can be enabled to enhance retrieval quality:
-- **Contextual Embeddings** for enriched semantic understanding
-- **Hybrid Search** combining vector and keyword search
-- **Agentic RAG** for specialized code example extraction
-- **Reranking** for improved result relevance using cross-encoder models
-- **Knowledge Graph** for AI hallucination detection and repository code analysis
+## Main Components
 
-See the [Configuration section](#configuration) below for details on how to enable and configure these strategies.
+### 1. MCP server
 
-## Vision
+File: [src/crawl4ai_mcp.py](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/src/crawl4ai_mcp.py)
 
-The Crawl4AI RAG MCP server is just the beginning. Here's where we're headed:
+This is the agent-facing server. It runs as an MCP service over SSE by default and exposes tools for crawling, retrieval, code-example search, and knowledge graph operations.
 
-1. **Integration with Archon**: Building this system directly into [Archon](https://github.com/coleam00/Archon) to create a comprehensive knowledge engine for AI coding assistants to build better AI agents.
+Implemented MCP tools:
 
-2. **Multiple Embedding Models**: Expanding beyond OpenAI to support a variety of embedding models, including the ability to run everything locally with Ollama for complete control and privacy.
+- `crawl_single_page`
+- `smart_crawl_url`
+- `get_available_sources`
+- `perform_rag_query`
+- `search_code_examples`
+- `check_ai_script_hallucinations`
+- `query_knowledge_graph`
+- `parse_github_repository`
 
-3. **Advanced RAG Strategies**: Implementing sophisticated retrieval techniques like contextual retrieval, late chunking, and others to move beyond basic "naive lookups" and significantly enhance the power and precision of the RAG system, especially as it integrates with Archon.
+### 2. OpenAI-compatible API
 
-4. **Enhanced Chunking Strategy**: Implementing a Context 7-inspired chunking approach that focuses on examples and creates distinct, semantically meaningful sections for each chunk, improving retrieval precision.
+File: [src/api_server.py](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/src/api_server.py)
 
-5. **Performance Optimization**: Increasing crawling and indexing speed to make it more realistic to "quickly" index new documentation to then leverage it within the same prompt in an AI coding assistant.
+This service provides a chat-completions style API around the same Supabase-backed knowledge base. It supports:
 
-## Features
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- conversation CRUD endpoints
+- source and page management endpoints
 
-- **Smart URL Detection**: Automatically detects and handles different URL types (regular webpages, sitemaps, text files)
-- **Recursive Crawling**: Follows internal links to discover content
-- **Parallel Processing**: Efficiently crawls multiple pages simultaneously
-- **Content Chunking**: Intelligently splits content by headers and size for better processing
-- **Vector Search**: Performs RAG over crawled content, optionally filtering by data source for precision
-- **Source Retrieval**: Retrieve sources available for filtering to guide the RAG process
+It also detects crawl intent inside user messages. If a message contains commands like `crawl https://... max_pages=20`, it crawls and indexes that source before returning a response.
 
-## Tools
+### 3. Streamlit frontend
 
-The server provides essential web crawling and search tools:
+File: [frontend/app.py](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/frontend/app.py)
 
-### Core Tools (Always Available)
+The frontend is a lightweight operator UI for:
 
-1. **`crawl_single_page`**: Quickly crawl a single web page and store its content in the vector database
-2. **`smart_crawl_url`**: Intelligently crawl a full website based on the type of URL provided (sitemap, llms-full.txt, or a regular webpage that needs to be crawled recursively)
-3. **`get_available_sources`**: Get a list of all available sources (domains) in the database
-4. **`perform_rag_query`**: Search for relevant content using semantic search with optional source filtering
+- creating and revisiting chat sessions
+- triggering crawl jobs
+- viewing indexed sources
+- browsing crawled pages
+- deleting pages or entire sources
 
-### Conditional Tools
+### 4. Shared utilities
 
-5. **`search_code_examples`** (requires `USE_AGENTIC_RAG=true`): Search specifically for code examples and their summaries from crawled documentation. This tool provides targeted code snippet retrieval for AI coding assistants.
+File: [src/utils.py](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/src/utils.py)
 
-### Knowledge Graph Tools (requires `USE_KNOWLEDGE_GRAPH=true`, see below)
+This module contains the core data-layer logic:
 
-6. **`parse_github_repository`**: Parse a GitHub repository into a Neo4j knowledge graph, extracting classes, methods, functions, and their relationships for hallucination detection
-7. **`check_ai_script_hallucinations`**: Analyze Python scripts for AI hallucinations by validating imports, method calls, and class usage against the knowledge graph
-8. **`query_knowledge_graph`**: Explore and query the Neo4j knowledge graph with commands like `repos`, `classes`, `methods`, and custom Cypher queries
+- Supabase client creation
+- embedding creation
+- batch insert logic
+- contextual embedding enrichment
+- code block extraction
+- source summarization
+- vector search for documents and code examples
+
+### 5. Knowledge graph utilities
+
+Files live under [knowledge_graphs](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/knowledge_graphs).
+
+These scripts support:
+
+- parsing Python repositories into Neo4j using AST-based extraction
+- analyzing AI-generated Python scripts
+- validating those scripts against the repository graph
+- querying the stored graph interactively
+
+## Implemented Features
+
+### Crawling and indexing
+
+- Single-page crawling
+- Smart URL handling for normal pages, sitemap URLs, and `.txt` files
+- Recursive internal-link crawling for websites
+- Parallel batch crawling
+- URL prioritization so article-like pages are crawled earlier
+- URL skipping rules for low-value pages such as pagination, tags, login, cart, and policy routes
+- Markdown-aware chunking with preferences for code block and paragraph boundaries
+- Source-level summaries stored per domain
+- Site profile and featured-story synthetic chunks added during deep crawl mode
+- Re-crawling support by deleting old rows for the same URL before inserting new ones
+
+### Retrieval and RAG
+
+- Vector similarity search over crawled content
+- Optional hybrid retrieval combining vector search with keyword matching
+- Optional reranking using `cross-encoder/ms-marco-MiniLM-L-6-v2`
+- Query rewriting for better semantic retrieval
+- Listing-intent detection for questions like “what articles do you have?”
+- Source-aware filtering
+- OpenAI-backed answer generation constrained to indexed knowledge
+
+### Code-example retrieval
+
+- Optional extraction of large code blocks from crawled markdown
+- LLM-generated summaries for each extracted code example
+- Separate `code_examples` vector index in Supabase
+- Dedicated MCP search tool for code-oriented retrieval
+
+### API and frontend operations
+
+- OpenAI-compatible `/v1/chat/completions`
+- Streaming and non-streaming responses
+- Conversation persistence in Supabase
+- Source listing, page listing, source deletion, and page deletion
+- Streamlit UI for chat and source management
+
+### Knowledge graph and hallucination detection
+
+- Optional Neo4j integration
+- GitHub repository parsing into repository, file, class, method, function, and import relationships
+- AST-based analysis of Python scripts
+- Validation of imports, class usage, methods, and function calls against the parsed graph
+- Interactive graph queries for repositories, classes, methods, and custom Cypher
+
+## Architecture
+
+### Storage layer
+
+Supabase stores three main datasets:
+
+- `sources`: source/domain summaries and aggregate counts
+- `crawled_pages`: chunked documentation or web content with embeddings
+- `code_examples`: extracted code snippets with embeddings and summaries
+- `conversations`: frontend/API chat history
+
+Schema file: [crawled_pages.sql](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/crawled_pages.sql)
+
+### Model usage
+
+OpenAI is used for:
+
+- embeddings via `text-embedding-3-small`
+- source summaries
+- contextual chunk descriptions
+- code example summaries
+- answer generation in the API server
+
+The code also contains commented placeholders for switching some operations back to a local Ollama setup, but the active implementation is OpenAI-based.
+
+## Retrieval Modes
+
+These environment flags control the advanced behavior:
+
+- `USE_CONTEXTUAL_EMBEDDINGS=true`
+  Enriches each chunk with LLM-generated context before embedding.
+
+- `USE_HYBRID_SEARCH=true`
+  Combines semantic search with exact keyword matches.
+
+- `USE_AGENTIC_RAG=true`
+  Extracts code examples into a separate searchable index.
+
+- `USE_RERANKING=true`
+  Reranks retrieved results with a cross-encoder model.
+
+- `USE_KNOWLEDGE_GRAPH=true`
+  Enables Neo4j-backed repository parsing and hallucination-checking tools.
 
 ## Prerequisites
 
-- [Docker/Docker Desktop](https://www.docker.com/products/docker-desktop/) if running the MCP server as a container (recommended)
-- [Python 3.12+](https://www.python.org/downloads/) if running the MCP server directly through uv
-- [Supabase](https://supabase.com/) (database for RAG)
-- [OpenAI API key](https://platform.openai.com/api-keys) (for generating embeddings)
-- [Neo4j](https://neo4j.com/) (optional, for knowledge graph functionality) - see [Knowledge Graph Setup](#knowledge-graph-setup) section
+- Python `3.12+`
+- [uv](https://docs.astral.sh/uv/) or Docker
+- A Supabase project
+- An OpenAI API key
+- Neo4j only if knowledge graph features are enabled
 
 ## Installation
 
-### Using Docker (Recommended)
+### Option 1: Local Python setup
 
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
-   ```
-
-2. Build the Docker image:
-   ```bash
-   docker build -t mcp/crawl4ai-rag --build-arg PORT=8051 .
-   ```
-
-3. Create a `.env` file based on the configuration section below
-
-### Using uv directly (no Docker)
-
-1. Clone this repository:
-   ```bash
-   git clone https://github.com/coleam00/mcp-crawl4ai-rag.git
-   cd mcp-crawl4ai-rag
-   ```
-
-2. Install uv if you don't have it:
-   ```bash
-   pip install uv
-   ```
-
-3. Create and activate a virtual environment:
-   ```bash
-   uv venv
-   .venv\Scripts\activate
-   # on Mac/Linux: source .venv/bin/activate
-   ```
-
-4. Install dependencies:
-   ```bash
-   uv pip install -e .
-   crawl4ai-setup
-   ```
-
-5. Create a `.env` file based on the configuration section below
-
-## Database Setup
-
-Before running the server, you need to set up the database with the pgvector extension:
-
-1. Go to the SQL Editor in your Supabase dashboard (create a new project first if necessary)
-
-2. Create a new query and paste the contents of `crawled_pages.sql`
-
-3. Run the query to create the necessary tables and functions
-
-## Knowledge Graph Setup (Optional)
-
-To enable AI hallucination detection and repository analysis features, you need to set up Neo4j.
-
-Also, the knowledge graph implementation isn't fully compatible with Docker yet, so I would recommend right now running directly through uv if you want to use the hallucination detection within the MCP server!
-
-For installing Neo4j:
-
-### Local AI Package (Recommended)
-
-The easiest way to get Neo4j running locally is with the [Local AI Package](https://github.com/coleam00/local-ai-packaged) - a curated collection of local AI services including Neo4j:
-
-1. **Clone the Local AI Package**:
-   ```bash
-   git clone https://github.com/coleam00/local-ai-packaged.git
-   cd local-ai-packaged
-   ```
-
-2. **Start Neo4j**:
-   Follow the instructions in the Local AI Package repository to start Neo4j with Docker Compose
-
-3. **Default connection details**:
-   - URI: `bolt://localhost:7687`
-   - Username: `neo4j`
-   - Password: Check the Local AI Package documentation for the default password
-
-### Manual Neo4j Installation
-
-Alternatively, install Neo4j directly:
-
-1. **Install Neo4j Desktop**: Download from [neo4j.com/download](https://neo4j.com/download/)
-
-2. **Create a new database**:
-   - Open Neo4j Desktop
-   - Create a new project and database
-   - Set a password for the `neo4j` user
-   - Start the database
-
-3. **Note your connection details**:
-   - URI: `bolt://localhost:7687` (default)
-   - Username: `neo4j` (default)
-   - Password: Whatever you set during creation
-
-## Configuration
-
-Create a `.env` file in the project root with the following variables:
-
+```bash
+git clone <your-repo-url>
+cd mcp-crawl4ai-rag
+uv venv
+source .venv/bin/activate
+uv pip install -e .
+crawl4ai-setup
 ```
-# MCP Server Configuration
+
+### Option 2: Docker setup
+
+```bash
+git clone <your-repo-url>
+cd mcp-crawl4ai-rag
+docker build -t mcp/crawl4ai-rag --build-arg PORT=8051 .
+```
+
+The Docker image currently runs the MCP server entrypoint from [Dockerfile](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/Dockerfile).
+
+## Environment Variables
+
+Create a `.env` file in the project root.
+
+```env
+# MCP server
 HOST=0.0.0.0
 PORT=8051
 TRANSPORT=sse
 
-# OpenAI API Configuration
+# API server
+API_PORT=8052
+
+# OpenAI
 OPENAI_API_KEY=your_openai_api_key
+MODEL_CHOICE=gpt-4o-mini
 
-# LLM for summaries and contextual embeddings
-MODEL_CHOICE=gpt-4.1-nano
+# Supabase
+SUPABASE_URL=your_supabase_project_url
+SUPABASE_SERVICE_KEY=your_supabase_service_key
 
-# RAG Strategies (set to "true" or "false", default to "false")
+# Retrieval features
 USE_CONTEXTUAL_EMBEDDINGS=false
 USE_HYBRID_SEARCH=false
 USE_AGENTIC_RAG=false
 USE_RERANKING=false
 USE_KNOWLEDGE_GRAPH=false
 
-# Supabase Configuration
-SUPABASE_URL=your_supabase_project_url
-SUPABASE_SERVICE_KEY=your_supabase_service_key
-
-# Neo4j Configuration (required for knowledge graph functionality)
+# Neo4j, only required when USE_KNOWLEDGE_GRAPH=true
 NEO4J_URI=bolt://localhost:7687
 NEO4J_USER=neo4j
 NEO4J_PASSWORD=your_neo4j_password
 ```
 
-### RAG Strategy Options
+## Supabase Setup
 
-The Crawl4AI RAG MCP server supports four powerful RAG strategies that can be enabled independently:
+Before running the project, execute the SQL in [crawled_pages.sql](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/crawled_pages.sql) inside your Supabase SQL editor.
 
-#### 1. **USE_CONTEXTUAL_EMBEDDINGS**
-When enabled, this strategy enhances each chunk's embedding with additional context from the entire document. The system passes both the full document and the specific chunk to an LLM (configured via `MODEL_CHOICE`) to generate enriched context that gets embedded alongside the chunk content.
+This creates:
 
-- **When to use**: Enable this when you need high-precision retrieval where context matters, such as technical documentation where terms might have different meanings in different sections.
-- **Trade-offs**: Slower indexing due to LLM calls for each chunk, but significantly better retrieval accuracy.
-- **Cost**: Additional LLM API calls during indexing.
+- vector-enabled content tables
+- similarity search functions for pages and code examples
+- a conversation table for the frontend/API
+- indexes and policies required by the current implementation
 
-#### 2. **USE_HYBRID_SEARCH**
-Combines traditional keyword search with semantic vector search to provide more comprehensive results. The system performs both searches in parallel and intelligently merges results, prioritizing documents that appear in both result sets.
+## Running The Project
 
-- **When to use**: Enable this when users might search using specific technical terms, function names, or when exact keyword matches are important alongside semantic understanding.
-- **Trade-offs**: Slightly slower search queries but more robust results, especially for technical content.
-- **Cost**: No additional API costs, just computational overhead.
-
-#### 3. **USE_AGENTIC_RAG**
-Enables specialized code example extraction and storage. When crawling documentation, the system identifies code blocks (≥300 characters), extracts them with surrounding context, generates summaries, and stores them in a separate vector database table specifically designed for code search.
-
-- **When to use**: Essential for AI coding assistants that need to find specific code examples, implementation patterns, or usage examples from documentation.
-- **Trade-offs**: Significantly slower crawling due to code extraction and summarization, requires more storage space.
-- **Cost**: Additional LLM API calls for summarizing each code example.
-- **Benefits**: Provides a dedicated `search_code_examples` tool that AI agents can use to find specific code implementations.
-
-#### 4. **USE_RERANKING**
-Applies cross-encoder reranking to search results after initial retrieval. Uses a lightweight cross-encoder model (`cross-encoder/ms-marco-MiniLM-L-6-v2`) to score each result against the original query, then reorders results by relevance.
-
-- **When to use**: Enable this when search precision is critical and you need the most relevant results at the top. Particularly useful for complex queries where semantic similarity alone might not capture query intent.
-- **Trade-offs**: Adds ~100-200ms to search queries depending on result count, but significantly improves result ordering.
-- **Cost**: No additional API costs - uses a local model that runs on CPU.
-- **Benefits**: Better result relevance, especially for complex queries. Works with both regular RAG search and code example search.
-
-#### 5. **USE_KNOWLEDGE_GRAPH**
-Enables AI hallucination detection and repository analysis using Neo4j knowledge graphs. When enabled, the system can parse GitHub repositories into a graph database and validate AI-generated code against real repository structures. (NOT fully compatible with Docker yet, I'd recommend running through uv)
-
-- **When to use**: Enable this for AI coding assistants that need to validate generated code against real implementations, or when you want to detect when AI models hallucinate non-existent methods, classes, or incorrect usage patterns.
-- **Trade-offs**: Requires Neo4j setup and additional dependencies. Repository parsing can be slow for large codebases, and validation requires repositories to be pre-indexed.
-- **Cost**: No additional API costs for validation, but requires Neo4j infrastructure (can use free local installation or cloud AuraDB).
-- **Benefits**: Provides three powerful tools: `parse_github_repository` for indexing codebases, `check_ai_script_hallucinations` for validating AI-generated code, and `query_knowledge_graph` for exploring indexed repositories.
-
-You can now tell the AI coding assistant to add a Python GitHub repository to the knowledge graph like:
-
-"Add https://github.com/pydantic/pydantic-ai.git to the knowledge graph"
-
-Make sure the repo URL ends with .git.
-
-You can also have the AI coding assistant check for hallucinations with scripts it just created, or you can manually run the command:
-
-```
-python knowledge_graphs/ai_hallucination_detector.py [full path to your script to analyze]
-```
-
-### Recommended Configurations
-
-**For general documentation RAG:**
-```
-USE_CONTEXTUAL_EMBEDDINGS=false
-USE_HYBRID_SEARCH=true
-USE_AGENTIC_RAG=false
-USE_RERANKING=true
-```
-
-**For AI coding assistant with code examples:**
-```
-USE_CONTEXTUAL_EMBEDDINGS=true
-USE_HYBRID_SEARCH=true
-USE_AGENTIC_RAG=true
-USE_RERANKING=true
-USE_KNOWLEDGE_GRAPH=false
-```
-
-**For AI coding assistant with hallucination detection:**
-```
-USE_CONTEXTUAL_EMBEDDINGS=true
-USE_HYBRID_SEARCH=true
-USE_AGENTIC_RAG=true
-USE_RERANKING=true
-USE_KNOWLEDGE_GRAPH=true
-```
-
-**For fast, basic RAG:**
-```
-USE_CONTEXTUAL_EMBEDDINGS=false
-USE_HYBRID_SEARCH=true
-USE_AGENTIC_RAG=false
-USE_RERANKING=false
-USE_KNOWLEDGE_GRAPH=false
-```
-
-## Running the Server
-
-### Using Docker
+### Run the MCP server
 
 ```bash
-docker run --env-file .env -p 8051:8051 mcp/crawl4ai-rag
+uv run python src/crawl4ai_mcp.py
 ```
 
-### Using Python
+By default this uses SSE and serves on `http://localhost:8051/sse`.
+
+Connection config example: [mcpo_config.json](/Users/beyzanurelbeyoglu/Desktop/mcp-crawl4ai-rag/mcpo_config.json)
+
+### Run the API server
 
 ```bash
-uv run src/crawl4ai_mcp.py
+uv run python src/api_server.py
 ```
 
-The server will start and listen on the configured host and port.
+Default API base URL:
 
-## Integration with MCP Clients
-
-### SSE Configuration
-
-Once you have the server running with SSE transport, you can connect to it using this configuration:
-
-```json
-{
-  "mcpServers": {
-    "crawl4ai-rag": {
-      "transport": "sse",
-      "url": "http://localhost:8051/sse"
-    }
-  }
-}
+```text
+http://localhost:8052
 ```
 
-> **Note for Windsurf users**: Use `serverUrl` instead of `url` in your configuration:
-> ```json
-> {
->   "mcpServers": {
->     "crawl4ai-rag": {
->       "transport": "sse",
->       "serverUrl": "http://localhost:8051/sse"
->     }
->   }
-> }
-> ```
->
-> **Note for Docker users**: Use `host.docker.internal` instead of `localhost` if your client is running in a different container. This will apply if you are using this MCP server within n8n!
+### Run the Streamlit frontend
 
-> **Note for Claude Code users**: 
-```
-claude mcp add-json crawl4ai-rag '{"type":"http","url":"http://localhost:8051/sse"}' --scope user
+```bash
+uv run streamlit run frontend/app.py
 ```
 
-### Stdio Configuration
+The frontend expects the API server at `http://localhost:8052`.
 
-Add this server to your MCP configuration for Claude Desktop, Windsurf, or any other MCP client:
+## MCP Tool Reference
 
-```json
-{
-  "mcpServers": {
-    "crawl4ai-rag": {
-      "command": "python",
-      "args": ["path/to/crawl4ai-mcp/src/crawl4ai_mcp.py"],
-      "env": {
-        "TRANSPORT": "stdio",
-        "OPENAI_API_KEY": "your_openai_api_key",
-        "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
-        "USE_KNOWLEDGE_GRAPH": "false",
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "your_neo4j_password"
-      }
-    }
-  }
-}
+### `crawl_single_page`
+
+Crawls one page, chunks it, stores it in Supabase, updates source metadata, and optionally extracts code examples.
+
+### `smart_crawl_url`
+
+Chooses the crawl strategy automatically:
+
+- `.txt` URL: fetch as text content
+- sitemap URL: parse and crawl listed pages
+- regular page: recursively crawl internal links
+
+### `get_available_sources`
+
+Returns indexed sources from Supabase so an agent can decide what to query.
+
+### `perform_rag_query`
+
+Searches the crawled content index, optionally limited to a source.
+
+### `search_code_examples`
+
+Searches the code example index. This is most useful when `USE_AGENTIC_RAG=true`.
+
+### `parse_github_repository`
+
+Parses a GitHub repository into Neo4j for graph-based repository understanding.
+
+### `check_ai_script_hallucinations`
+
+Analyzes a Python file and validates its code usage against the Neo4j graph.
+
+### `query_knowledge_graph`
+
+Provides structured graph exploration commands and supports custom Cypher queries.
+
+## API Behavior
+
+The API server is not only a wrapper around retrieval. It also adds some practical behavior:
+
+- If a user message contains a URL and crawl intent, it triggers indexing directly
+- If a user asks for a list of available articles or pages, it bypasses semantic RAG and enumerates indexed URLs from the database
+- For standard questions, it builds a constrained system prompt with retrieved context and calls OpenAI chat completions
+
+This makes the API usable as both a chat endpoint and a lightweight operator endpoint for source ingestion.
+
+## Knowledge Graph Workflow
+
+When enabled, the intended flow is:
+
+1. Start Neo4j
+2. Run the MCP server with `USE_KNOWLEDGE_GRAPH=true`
+3. Parse a Python GitHub repository with `parse_github_repository`
+4. Run `check_ai_script_hallucinations` on an AI-generated `.py` file
+5. Inspect the graph with `query_knowledge_graph` if needed
+
+The repository parser is AST-based and designed to insert code structure into Neo4j directly rather than relying on LLM extraction.
+
+## Current Limitations
+
+- The Docker setup is centered on the MCP server only
+- The frontend and API server are separate processes and are not containerized here
+- Knowledge graph features require extra infrastructure and are better suited to local `uv` execution than the current Docker path
+- The implementation is currently tailored to OpenAI embeddings and chat generation
+- The frontend hardcodes the API server URL to `http://localhost:8052`
+- There is no formal test suite in the current repository snapshot
+
+## Repository Layout
+
+```text
+.
+├── frontend/
+│   └── app.py
+├── knowledge_graphs/
+│   ├── ai_hallucination_detector.py
+│   ├── ai_script_analyzer.py
+│   ├── hallucination_reporter.py
+│   ├── knowledge_graph_validator.py
+│   ├── parse_repo_into_neo4j.py
+│   ├── query_knowledge_graph.py
+│   └── test_script.py
+├── src/
+│   ├── api_server.py
+│   ├── crawl4ai_mcp.py
+│   ├── todo.txt
+│   └── utils.py
+├── crawled_pages.sql
+├── Dockerfile
+├── mcpo_config.json
+├── pyproject.toml
+└── README.md
 ```
 
-### Docker with Stdio Configuration
+## Summary
 
-```json
-{
-  "mcpServers": {
-    "crawl4ai-rag": {
-      "command": "docker",
-      "args": ["run", "--rm", "-i", 
-               "-e", "TRANSPORT", 
-               "-e", "OPENAI_API_KEY", 
-               "-e", "SUPABASE_URL", 
-               "-e", "SUPABASE_SERVICE_KEY",
-               "-e", "USE_KNOWLEDGE_GRAPH",
-               "-e", "NEO4J_URI",
-               "-e", "NEO4J_USER",
-               "-e", "NEO4J_PASSWORD",
-               "mcp/crawl4ai"],
-      "env": {
-        "TRANSPORT": "stdio",
-        "OPENAI_API_KEY": "your_openai_api_key",
-        "SUPABASE_URL": "your_supabase_url",
-        "SUPABASE_SERVICE_KEY": "your_supabase_service_key",
-        "USE_KNOWLEDGE_GRAPH": "false",
-        "NEO4J_URI": "bolt://localhost:7687",
-        "NEO4J_USER": "neo4j",
-        "NEO4J_PASSWORD": "your_neo4j_password"
-      }
-    }
-  }
-}
-```
+This project is no longer just an MCP server. In its current form, it is a small retrieval platform with:
 
-## Knowledge Graph Architecture
+- a crawl-and-index pipeline
+- a Supabase-backed RAG layer
+- an OpenAI-compatible chat API
+- a Streamlit operations UI
+- optional Neo4j-based repository validation tooling
 
-The knowledge graph system stores repository code structure in Neo4j with the following components:
-
-### Core Components (`knowledge_graphs/` folder):
-
-- **`parse_repo_into_neo4j.py`**: Clones and analyzes GitHub repositories, extracting Python classes, methods, functions, and imports into Neo4j nodes and relationships
-- **`ai_script_analyzer.py`**: Parses Python scripts using AST to extract imports, class instantiations, method calls, and function usage
-- **`knowledge_graph_validator.py`**: Validates AI-generated code against the knowledge graph to detect hallucinations (non-existent methods, incorrect parameters, etc.)
-- **`hallucination_reporter.py`**: Generates comprehensive reports about detected hallucinations with confidence scores and recommendations
-- **`query_knowledge_graph.py`**: Interactive CLI tool for exploring the knowledge graph (functionality now integrated into MCP tools)
-
-### Knowledge Graph Schema:
-
-The Neo4j database stores code structure as:
-
-**Nodes:**
-- `Repository`: GitHub repositories
-- `File`: Python files within repositories  
-- `Class`: Python classes with methods and attributes
-- `Method`: Class methods with parameter information
-- `Function`: Standalone functions
-- `Attribute`: Class attributes
-
-**Relationships:**
-- `Repository` -[:CONTAINS]-> `File`
-- `File` -[:DEFINES]-> `Class`
-- `File` -[:DEFINES]-> `Function`
-- `Class` -[:HAS_METHOD]-> `Method`
-- `Class` -[:HAS_ATTRIBUTE]-> `Attribute`
-
-### Workflow:
-
-1. **Repository Parsing**: Use `parse_github_repository` tool to clone and analyze open-source repositories
-2. **Code Validation**: Use `check_ai_script_hallucinations` tool to validate AI-generated Python scripts
-3. **Knowledge Exploration**: Use `query_knowledge_graph` tool to explore available repositories, classes, and methods
-
-## Building Your Own Server
-
-This implementation provides a foundation for building more complex MCP servers with web crawling capabilities. To build your own:
-
-1. Add your own tools by creating methods with the `@mcp.tool()` decorator
-2. Create your own lifespan function to add your own dependencies
-3. Modify the `utils.py` file for any helper functions you need
-4. Extend the crawling capabilities by adding more specialized crawlers
+That makes it suitable both as an AI-agent backend and as a supervised demo system for crawling, indexing, retrieval, and AI code validation workflows.

@@ -1,0 +1,17 @@
+
+
+- Retry connection for the frontend 
+- when crawling a page go to subpages as well and extract all the content. = limit page + return the # of pages crawled.
+- explaination + summery of embedded sites
+- a sites section with # of sites given as input = retrive content and store, can delete or add sites
+- PostgrSQL for the DB 
+
+
+== done
+
+
+- recrawl 24 hr
+- cache like search on site if needed
+- multiple sites needs source = mashed 
+
+

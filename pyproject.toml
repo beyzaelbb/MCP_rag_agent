@@ -12,4 +12,8 @@ dependencies = [
     "dotenv==0.9.9",
     "sentence-transformers>=4.1.0",
     "neo4j>=5.28.1",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "streamlit>=1.56.0",
+    "requests>=2.32.3",
 ]
