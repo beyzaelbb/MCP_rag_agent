@@ -3,6 +3,7 @@ Utility functions for the Crawl4AI MCP server.
 """
 import os
 import concurrent.futures
+import threading
 from typing import List, Dict, Any, Optional, Tuple
 import json
 from supabase import create_client, Client
@@ -14,6 +15,29 @@ import time
 # ── OpenAI client ──
 openai.api_key = os.getenv("OPENAI_API_KEY")
 EMBEDDING_DIM = 1536  # OpenAI text-embedding-3-small dimension
+
+# ── Embedding cache ──────────────────────────────────────────────────────────
+# Maps normalized text → embedding vector.
+# Embeddings are deterministic so no TTL is needed — the same text always
+# produces the same vector. The cache is bounded to prevent unbounded growth:
+# once it hits the limit the oldest entry is evicted (simple FIFO).
+_EMBEDDING_CACHE: dict[str, List[float]] = {}
+_EMBEDDING_CACHE_LOCK = threading.Lock()
+_EMBEDDING_CACHE_MAX = 2000  # max number of cached texts
+
+
+def _cache_get(text: str) -> Optional[List[float]]:
+    with _EMBEDDING_CACHE_LOCK:
+        return _EMBEDDING_CACHE.get(text)
+
+
+def _cache_set(text: str, embedding: List[float]) -> None:
+    with _EMBEDDING_CACHE_LOCK:
+        if len(_EMBEDDING_CACHE) >= _EMBEDDING_CACHE_MAX:
+            # Evict the oldest entry
+            oldest = next(iter(_EMBEDDING_CACHE))
+            del _EMBEDDING_CACHE[oldest]
+        _EMBEDDING_CACHE[text] = embedding
 
 # ── Ollama (local) client — uncomment to switch back to Ollama ──
 # ollama_client = OpenAI(
@@ -41,66 +65,77 @@ def get_supabase_client() -> Client:
 def create_embeddings_batch(texts: List[str]) -> List[List[float]]:
     """
     Create embeddings for multiple texts in a single API call.
-    
+    Texts already present in the cache are returned immediately without an API call.
+
     Args:
         texts: List of texts to create embeddings for
-        
+
     Returns:
         List of embeddings (each embedding is a list of floats)
     """
     if not texts:
         return []
-    
+
+    # Split into cache hits and misses
+    results: List[Optional[List[float]]] = [None] * len(texts)
+    miss_indices: List[int] = []
+    miss_texts: List[str] = []
+
+    for i, text in enumerate(texts):
+        cached = _cache_get(text)
+        if cached is not None:
+            results[i] = cached
+        else:
+            miss_indices.append(i)
+            miss_texts.append(text)
+
+    if not miss_texts:
+        return results  # all cache hits
+
+    cache_hits = len(texts) - len(miss_texts)
+    if cache_hits:
+        print(f"[embedding cache] {cache_hits}/{len(texts)} hits, {len(miss_texts)} API calls needed")
+
     max_retries = 3
-    retry_delay = 1.0  # Start with 1 second delay
-    
+    retry_delay = 1.0
+
     for retry in range(max_retries):
         try:
             # ── OpenAI embeddings ──
             response = openai.embeddings.create(
                 model="text-embedding-3-small",
-                input=texts
+                input=miss_texts
             )
-            # ── Ollama embeddings — uncomment to switch to Ollama ──
-            # response = ollama_client.embeddings.create(
-            #     model=OLLAMA_EMBEDDING_MODEL,
-            #     input=texts
-            # )
-            return [item.embedding for item in response.data]
+            new_embeddings = [item.embedding for item in response.data]
+            for idx, embedding in zip(miss_indices, new_embeddings):
+                _cache_set(texts[idx], embedding)
+                results[idx] = embedding
+            return results
         except Exception as e:
             if retry < max_retries - 1:
                 print(f"Error creating batch embeddings (attempt {retry + 1}/{max_retries}): {e}")
                 print(f"Retrying in {retry_delay} seconds...")
                 time.sleep(retry_delay)
-                retry_delay *= 2  # Exponential backoff
+                retry_delay *= 2
             else:
                 print(f"Failed to create batch embeddings after {max_retries} attempts: {e}")
-                # Try creating embeddings one by one as fallback
                 print("Attempting to create embeddings individually...")
-                embeddings = []
                 successful_count = 0
-                
-                for i, text in enumerate(texts):
+                for i, text in zip(miss_indices, miss_texts):
                     try:
-                        # ── OpenAI fallback ──
                         individual_response = openai.embeddings.create(
                             model="text-embedding-3-small",
                             input=[text]
                         )
-                        # ── Ollama fallback — uncomment to switch to Ollama ──
-                        # individual_response = ollama_client.embeddings.create(
-                        #     model=OLLAMA_EMBEDDING_MODEL,
-                        #     input=[text]
-                        # )
-                        embeddings.append(individual_response.data[0].embedding)
+                        embedding = individual_response.data[0].embedding
+                        _cache_set(text, embedding)
+                        results[i] = embedding
                         successful_count += 1
                     except Exception as individual_error:
                         print(f"Failed to create embedding for text {i}: {individual_error}")
-                        # Add zero embedding as fallback
-                        embeddings.append([0.0] * EMBEDDING_DIM)  # OpenAI: 1536, llama3.2:3b: 3072
-                
-                print(f"Successfully created {successful_count}/{len(texts)} embeddings individually")
-                return embeddings
+                        results[i] = [0.0] * EMBEDDING_DIM
+                print(f"Successfully created {successful_count}/{len(miss_texts)} embeddings individually")
+                return results
 
 def create_embedding(text: str) -> List[float]:
     """
@@ -193,18 +228,18 @@ def process_chunk_with_context(args):
     return generate_contextual_embedding(full_document, content)
 
 def add_documents_to_supabase(
-    client: Client, 
-    urls: List[str], 
+    client: Client,
+    urls: List[str],
     chunk_numbers: List[int],
-    contents: List[str], 
+    contents: List[str],
     metadatas: List[Dict[str, Any]],
     url_to_full_document: Dict[str, str],
-    batch_size: int = 20
+    batch_size: int = 20,
+    skip_existing: bool = False,
 ) -> None:
     """
     Add documents to the Supabase crawled_pages table in batches.
-    Deletes existing records with the same URLs before inserting to prevent duplicates.
-    
+
     Args:
         client: Supabase client
         urls: List of URLs
@@ -213,24 +248,49 @@ def add_documents_to_supabase(
         metadatas: List of document metadata
         url_to_full_document: Dictionary mapping URLs to their full document content
         batch_size: Size of each batch for insertion
+        skip_existing: When True (recrawl mode), only insert URLs not already in the DB
+                       so old articles are preserved and only new ones are added.
     """
-    # Get unique URLs to delete existing records
     unique_urls = list(set(urls))
-    
-    # Delete existing records for these URLs in a single operation
-    try:
-        if unique_urls:
-            # Use the .in_() filter to delete all records with matching URLs
-            client.table("crawled_pages").delete().in_("url", unique_urls).execute()
-    except Exception as e:
-        print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
-        # Fallback: delete records one by one
-        for url in unique_urls:
-            try:
-                client.table("crawled_pages").delete().eq("url", url).execute()
-            except Exception as inner_e:
-                print(f"Error deleting record for URL {url}: {inner_e}")
-                # Continue with the next URL even if one fails
+
+    if skip_existing:
+        # Find which URLs are already stored and exclude them entirely
+        try:
+            existing = (
+                client.table("crawled_pages")
+                .select("url")
+                .in_("url", unique_urls)
+                .execute()
+                .data
+            )
+            existing_urls = {row["url"] for row in existing}
+        except Exception as e:
+            print(f"Could not fetch existing URLs, inserting all: {e}")
+            existing_urls = set()
+
+        # Filter down to only new URLs
+        keep = [i for i, u in enumerate(urls) if u not in existing_urls]
+        if not keep:
+            print("[crawl] No new pages found during recrawl — nothing inserted.")
+            return
+        urls = [urls[i] for i in keep]
+        chunk_numbers = [chunk_numbers[i] for i in keep]
+        contents = [contents[i] for i in keep]
+        metadatas = [metadatas[i] for i in keep]
+        unique_urls = list(set(urls))
+        print(f"[crawl] Recrawl: {len(urls)} new chunks to insert (skipping existing).")
+    else:
+        # First crawl: replace any existing records for these URLs
+        try:
+            if unique_urls:
+                client.table("crawled_pages").delete().in_("url", unique_urls).execute()
+        except Exception as e:
+            print(f"Batch delete failed: {e}. Trying one-by-one deletion as fallback.")
+            for url in unique_urls:
+                try:
+                    client.table("crawled_pages").delete().eq("url", url).execute()
+                except Exception as inner_e:
+                    print(f"Error deleting record for URL {url}: {inner_e}")
     
     # Check if MODEL_CHOICE is set for contextual embeddings
     use_contextual_embeddings = os.getenv("USE_CONTEXTUAL_EMBEDDINGS", "false") == "true"
@@ -627,35 +687,43 @@ def add_code_examples_to_supabase(
         print(f"Inserted batch {i//batch_size + 1} of {(total_items + batch_size - 1)//batch_size} code examples")
 
 
-def update_source_info(client: Client, source_id: str, summary: str, word_count: int):
+def update_source_info(client: Client, source_id: str, summary: str, word_count: int, url: Optional[str] = None):
     """
     Update or insert source information in the sources table.
-    
+
     Args:
         client: Supabase client
         source_id: The source ID (domain)
         summary: Summary of the source
         word_count: Total word count for the source
+        url: The original URL that was crawled (stored so the scheduler can recrawl it)
     """
     try:
-        # Try to update existing source
-        result = client.table('sources').update({
+        update_payload: Dict[str, Any] = {
             'summary': summary,
             'total_word_count': word_count,
-            'updated_at': 'now()'
-        }).eq('source_id', source_id).execute()
-        
+            'updated_at': 'now()',
+        }
+        if url:
+            update_payload['url'] = url
+
+        # Try to update existing source
+        result = client.table('sources').update(update_payload).eq('source_id', source_id).execute()
+
         # If no rows were updated, insert new source
         if not result.data:
-            client.table('sources').insert({
+            insert_payload: Dict[str, Any] = {
                 'source_id': source_id,
                 'summary': summary,
-                'total_word_count': word_count
-            }).execute()
+                'total_word_count': word_count,
+            }
+            if url:
+                insert_payload['url'] = url
+            client.table('sources').insert(insert_payload).execute()
             print(f"Created new source: {source_id}")
         else:
             print(f"Updated source: {source_id}")
-            
+
     except Exception as e:
         print(f"Error updating source {source_id}: {e}")
 

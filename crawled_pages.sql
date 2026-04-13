@@ -7,9 +7,15 @@ create table if not exists sources (
     source_id text primary key,
     summary text,
     total_word_count integer default 0,
+    url text,
+    next_crawl_at timestamp with time zone,
     created_at timestamp with time zone default timezone('utc'::text, now()) not null,
     updated_at timestamp with time zone default timezone('utc'::text, now()) not null
 );
+
+-- Migration: add columns if upgrading an existing database
+alter table sources add column if not exists url text;
+alter table sources add column if not exists next_crawl_at timestamp with time zone;
 
 alter table sources enable row level security;
 

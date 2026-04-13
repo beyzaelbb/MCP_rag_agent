@@ -2,6 +2,7 @@ import streamlit as st
 import requests
 import json
 import time
+from datetime import datetime, timezone
 
 API_URL = "http://localhost:8052"
 RETRY_ATTEMPTS = 3
@@ -191,12 +192,39 @@ with st.sidebar:
                 word_count = source.get("total_word_count", 0)
                 page_count = source.get("page_count", 0)
                 summary = source.get("summary", "")
+                next_crawl_at = source.get("next_crawl_at")
+                is_crawling = source.get("is_crawling", False)
 
-                with st.expander(f"🌐 {sid}  ·  {page_count} page{'s' if page_count != 1 else ''}  ·  {word_count:,} words"):
+                # Format next recrawl time for display
+                if is_crawling:
+                    crawl_badge = "🔄 Crawling now…"
+                elif next_crawl_at:
+                    try:
+                        dt = datetime.fromisoformat(next_crawl_at.replace("Z", "+00:00"))
+                        now_utc = datetime.now(timezone.utc)
+                        diff = dt - now_utc
+                        hours_left = int(diff.total_seconds() // 3600)
+                        mins_left = int((diff.total_seconds() % 3600) // 60)
+                        if diff.total_seconds() < 0:
+                            crawl_badge = "⏰ Recrawl overdue"
+                        elif hours_left > 0:
+                            crawl_badge = f"⏰ Recrawl in {hours_left}h {mins_left}m"
+                        else:
+                            crawl_badge = f"⏰ Recrawl in {mins_left}m"
+                    except Exception:
+                        crawl_badge = "⏰ Auto-recrawl on"
+                else:
+                    crawl_badge = ""
+
+                expander_label = f"🌐 {sid}  ·  {page_count} page{'s' if page_count != 1 else ''}  ·  {word_count:,} words"
+                if crawl_badge:
+                    expander_label += f"  ·  {crawl_badge}"
+
+                with st.expander(expander_label):
                     if summary:
                         st.caption(summary)
 
-                    col_del, col_pages = st.columns([1, 1])
+                    col_del, col_recrawl = st.columns([1, 1])
                     with col_del:
                         if st.button(f"🗑 Delete entire source", key=f"del_{sid}", type="secondary", use_container_width=True):
                             with st.spinner(f"Deleting {sid} …"):
@@ -208,6 +236,18 @@ with st.sidebar:
                                     st.rerun()
                                 else:
                                     st.error(del_resp.json().get("error", "Unknown error"))
+                    with col_recrawl:
+                        recrawl_disabled = is_crawling
+                        recrawl_label = "🔄 Crawling…" if is_crawling else "🔄 Recrawl Now"
+                        if st.button(recrawl_label, key=f"recrawl_{sid}", use_container_width=True, disabled=recrawl_disabled):
+                            resp = api_post(f"/sources/{sid}/recrawl", timeout=10)
+                            if resp is None:
+                                backend_offline_msg()
+                            elif resp.json().get("success"):
+                                st.success(f"Recrawl of {sid} started!")
+                                st.rerun()
+                            else:
+                                st.error(resp.json().get("error", "Could not start recrawl"))
 
                     st.markdown("**Crawled pages:**")
                     pages_resp = api_get(f"/sources/{sid}/pages", timeout=10)
@@ -243,6 +283,11 @@ with st.sidebar:
                                     else:
                                         st.error(dr.json().get("error", "Error"))
                             st.divider()
+
+        # Auto-refresh only while at least one source is being crawled
+        if any(s.get("is_crawling") for s in sources):
+            time.sleep(3)
+            st.rerun()
 
 
 # ── Main chat area ────────────────────────────────────────────────────────────

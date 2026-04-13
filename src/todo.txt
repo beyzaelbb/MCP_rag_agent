@@ -10,8 +10,8 @@
 == done
 
 
-- recrawl 24 hr
+- recrawl 24 hr +
 - cache like search on site if needed
-- multiple sites needs source = mashed 
+- multiple sites needs source = mashed +
 
 

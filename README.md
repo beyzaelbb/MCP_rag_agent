@@ -102,17 +102,38 @@ These scripts support:
 - Markdown-aware chunking with preferences for code block and paragraph boundaries
 - Source-level summaries stored per domain
 - Site profile and featured-story synthetic chunks added during deep crawl mode
-- Re-crawling support by deleting old rows for the same URL before inserting new ones
+- First crawl replaces existing records; recrawls only add new pages — old articles are never deleted
+
+### Auto-recrawl scheduler
+
+- Every crawled source automatically schedules a recrawl 24 hours after indexing
+- The scheduler sleeps until the exact due time rather than polling on a fixed interval
+- When a recrawl fires, already-indexed URLs are skipped entirely at the crawl loop level — no redundant fetching or re-embedding
+- Only new pages discovered since the last crawl are inserted
+- Auto-recrawls default to `max_pages=20`; manual crawls via the chat interface accept a user-specified limit
+- A `POST /sources/{source_id}/recrawl` endpoint allows triggering an immediate recrawl from the UI
 
 ### Retrieval and RAG
 
-- Vector similarity search over crawled content
+- Vector similarity search over crawled content across all indexed sources simultaneously
+- Source-diversity cap: results ranked globally by similarity, with each source limited to 5 chunks maximum so no single site dominates when multiple sources cover the same topic
+- Featured-story and site-profile index chunks excluded from RAG so the model only receives actual article body content
+- Full-text fallback: when vector search returns no results (e.g. for specific named entities or non-ASCII names), a keyword-based `ilike` content search is run against Supabase automatically
 - Optional hybrid retrieval combining vector search with keyword matching
 - Optional reranking using `cross-encoder/ms-marco-MiniLM-L-6-v2`
 - Query rewriting for better semantic retrieval
 - Listing-intent detection for questions like “what articles do you have?”
 - Source-aware filtering
+- Multi-source synthesis: when multiple sources cover the same topic the model is instructed to combine perspectives and highlight differences in framing or emphasis
+- Every answer ends with a `**Sources:**` section of clickable article links derived only from context actually used in the answer
 - OpenAI-backed answer generation constrained to indexed knowledge
+
+### Embedding cache
+
+- In-memory cache for all OpenAI embedding API calls, bounded at 2000 entries with FIFO eviction
+- Thread-safe; no TTL required since embeddings are deterministic
+- Covers all call paths: user queries, rewritten queries, keyword fallback queries, and document chunk embeddings
+- Cache hits are logged so utilization is visible in server output
 
 ### Code-example retrieval
 
@@ -127,7 +148,10 @@ These scripts support:
 - Streaming and non-streaming responses
 - Conversation persistence in Supabase
 - Source listing, page listing, source deletion, and page deletion
+- `POST /sources/{source_id}/recrawl` for immediate manual recrawl
 - Streamlit UI for chat and source management
+- Source expander shows live recrawl countdown (`⏰ Recrawl in Xh Ym`) or active crawl indicator (`🔄 Crawling now…`)
+- Frontend auto-refreshes every 3 seconds while any source is actively being crawled, and stops automatically when idle
 
 ### Knowledge graph and hallucination detection
 
@@ -143,7 +167,7 @@ These scripts support:
 
 Supabase stores three main datasets:
 
-- `sources`: source/domain summaries and aggregate counts
+- `sources`: source/domain summaries, aggregate counts, original crawl URL, and `next_crawl_at` timestamp for the auto-recrawl scheduler
 - `crawled_pages`: chunked documentation or web content with embeddings
 - `code_examples`: extracted code snippets with embeddings and summaries
 - `conversations`: frontend/API chat history
@@ -256,6 +280,13 @@ This creates:
 - similarity search functions for pages and code examples
 - a conversation table for the frontend/API
 - indexes and policies required by the current implementation
+
+If you have an existing database from a previous version, run this migration to add the scheduler columns:
+
+```sql
+alter table sources add column if not exists url text;
+alter table sources add column if not exists next_crawl_at timestamp with time zone;
+```
 
 ## Running The Project
 

@@ -8,6 +8,8 @@ import json
 import time
 import uuid
 import asyncio
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import List, Optional, Any
 from urllib.parse import urlparse
@@ -30,8 +32,89 @@ from utils import (
 openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 MODEL = os.getenv("MODEL_CHOICE", "gpt-4o-mini")
 RAG_MODEL_ID = "crawl4ai-rag"
+RECRAWL_INTERVAL_HOURS = 24
 
-app = FastAPI(title="Crawl4AI RAG API")
+# Track which sources are currently being (re)crawled to avoid duplicate jobs
+_crawling_sources: set[str] = set()
+
+
+def set_next_crawl(supabase, source_id: str) -> None:
+    """Set next_crawl_at to 24 hours from now for the given source."""
+    next_time = (datetime.now(timezone.utc) + timedelta(hours=RECRAWL_INTERVAL_HOURS)).isoformat()
+    try:
+        supabase.table("sources").update({"next_crawl_at": next_time}).eq("source_id", source_id).execute()
+        print(f"[scheduler] Next crawl for {source_id} scheduled at {next_time}")
+    except Exception as e:
+        print(f"[scheduler] Failed to set next_crawl_at for {source_id}: {e}")
+
+
+async def auto_recrawl_scheduler() -> None:
+    """Background task: sleeps until the next source is due, then fires its recrawl.
+
+    Rather than polling on a fixed interval, we query the earliest next_crawl_at
+    and sleep precisely until that moment. After waking we fire all sources whose
+    deadline has arrived, then repeat.
+    """
+    print("[scheduler] Auto-recrawl scheduler started.")
+    while True:
+        try:
+            supabase = get_supabase_client()
+            # Find the soonest upcoming crawl
+            row = (
+                supabase.table("sources")
+                .select("next_crawl_at")
+                .not_.is_("next_crawl_at", "null")
+                .order("next_crawl_at")
+                .limit(1)
+                .execute()
+                .data
+            )
+            if not row:
+                # No sources scheduled yet — check again in an hour
+                await asyncio.sleep(3600)
+                continue
+
+            next_due = datetime.fromisoformat(row[0]["next_crawl_at"].replace("Z", "+00:00"))
+            sleep_secs = max(0.0, (next_due - datetime.now(timezone.utc)).total_seconds())
+            print(f"[scheduler] Next recrawl in {sleep_secs:.0f}s ({next_due.isoformat()})")
+            await asyncio.sleep(sleep_secs)
+
+            # Fire all sources that are now due (handles ties / near-simultaneous deadlines)
+            now_iso = datetime.now(timezone.utc).isoformat()
+            due_rows = (
+                supabase.table("sources")
+                .select("source_id, url")
+                .lte("next_crawl_at", now_iso)
+                .not_.is_("next_crawl_at", "null")
+                .execute()
+                .data
+            )
+            for r in due_rows:
+                sid = r["source_id"]
+                crawl_url = (r.get("url") or "").strip() or f"https://{sid}"
+                if sid in _crawling_sources:
+                    print(f"[scheduler] Skipping {sid} — already crawling")
+                    continue
+                print(f"[scheduler] Recrawling {sid} from {crawl_url}")
+                asyncio.create_task(crawl_and_store(crawl_url, max_pages=MAX_PAGES_DEFAULT, is_recrawl=True))
+
+        except Exception as e:
+            print(f"[scheduler] Error: {e}")
+            await asyncio.sleep(60)  # back off briefly on unexpected errors
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    task = asyncio.create_task(auto_recrawl_scheduler())
+    yield
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+
+app = FastAPI(title="Crawl4AI RAG API", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -151,14 +234,40 @@ async def crawl_single_page(crawler, url: str) -> tuple[str, list[tuple[str, str
     return content, links
 
 
-async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT) -> str:
-    """Crawl a URL and its subpages, store everything in Supabase."""
+async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT, is_recrawl: bool = False) -> str:
+    """Crawl a URL and its subpages, store everything in Supabase.
+
+    When is_recrawl=True, existing articles are preserved and only new URLs are added.
+    """
+    source_id = urlparse(url).netloc
+    _crawling_sources.add(source_id)
     try:
         from crawl4ai import AsyncWebCrawler, BrowserConfig
         supabase = get_supabase_client()
         source_id = urlparse(url).netloc
 
-        visited: set[str] = set()
+        # For recrawls, pre-load every URL already in the DB for this source.
+        # We add them to `visited` so the crawl loop skips them entirely —
+        # no fetching, no embedding, no wasted API calls.
+        # The root URL is excluded so we still crawl the homepage to discover new links.
+        if is_recrawl:
+            try:
+                existing_rows = (
+                    supabase.table("crawled_pages")
+                    .select("url")
+                    .eq("source_id", source_id)
+                    .execute()
+                    .data
+                )
+                already_crawled = {row["url"] for row in existing_rows} - {url}
+                print(f"[crawl] Recrawl: skipping {len(already_crawled)} already-indexed URLs")
+            except Exception as e:
+                print(f"[crawl] Could not fetch existing URLs: {e}")
+                already_crawled = set()
+        else:
+            already_crawled = set()
+
+        visited: set[str] = already_crawled.copy()
         # Two-section queue:
         #   homepage_queue — links found on the root page, kept in page order (top story first)
         #   deep_queue     — links found on subpages, sorted by priority
@@ -185,10 +294,11 @@ async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT) -> str:
         def queued_urls() -> set[str]:
             return {u for u, _ in homepage_queue} | {u for u, _ in deep_queue}
 
-        print(f"[crawl] Starting deep crawl of {url} (max {max_pages} pages)")
+        print(f"[crawl] Starting {'re' if is_recrawl else ''}crawl of {url} (max {max_pages} new pages)")
 
+        new_pages_crawled = 0
         async with AsyncWebCrawler(config=BrowserConfig(headless=True)) as crawler:
-            while len(visited) < max_pages:
+            while new_pages_crawled < max_pages:
                 item = next_url()
                 if item is None:
                     break
@@ -196,6 +306,7 @@ async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT) -> str:
                 if current_url in visited:
                     continue
                 visited.add(current_url)
+                new_pages_crawled += 1
 
                 print(f"[crawl] ({len(visited)}/{max_pages}) {current_url}")
                 content, links = await crawl_single_page(crawler, current_url)
@@ -246,7 +357,7 @@ async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT) -> str:
                     all_chunks.append(chunk)
                     all_metadatas.append({"source": current_url, "source_id": source_id})
 
-        pages_crawled = len(visited)
+        pages_crawled = new_pages_crawled
 
         if not all_chunks:
             return f"No content extracted from {url}"
@@ -284,25 +395,32 @@ async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT) -> str:
                 url_to_full_doc[url] = url_to_full_doc.get(url, "") + "\n\n" + featured_text
 
         # Store everything in Supabase
-        update_source_info(supabase, source_id, site_summary, total_words)
+        update_source_info(supabase, source_id, site_summary, total_words, url=url)
         add_documents_to_supabase(
             supabase, all_urls, all_chunk_numbers, all_chunks,
-            all_metadatas, url_to_full_doc
+            all_metadatas, url_to_full_doc,
+            skip_existing=is_recrawl,
         )
+        set_next_crawl(supabase, source_id)
 
         print(f"[crawl] Done. {pages_crawled} pages, {len(all_chunks)} chunks stored.")
+        next_crawl_dt = datetime.now(timezone.utc) + timedelta(hours=RECRAWL_INTERVAL_HOURS)
+        next_crawl_str = next_crawl_dt.strftime("%Y-%m-%d %H:%M UTC")
         return (
             f"Successfully crawled **{source_id}**.\n\n"
             f"- **{pages_crawled} page{'s' if pages_crawled != 1 else ''}** crawled"
             f"{' (limit reached)' if pages_crawled >= max_pages else ''}\n"
             f"- **{len(all_chunks)} chunks** stored\n"
-            f"- **{total_words:,} words** indexed\n\n"
+            f"- **{total_words:,} words** indexed\n"
+            f"- **Auto-recrawl** scheduled every {RECRAWL_INTERVAL_HOURS}h (next: {next_crawl_str})\n\n"
             f"You can now ask questions about this content."
         )
 
     except Exception as e:
         print(f"[crawl] Error: {e}")
         return f"Error crawling {url}: {str(e)}"
+    finally:
+        _crawling_sources.discard(source_id)
 
 
 # ── RAG helpers ──
@@ -409,38 +527,36 @@ def _rewrite_query_for_embedding(query: str) -> str:
 def get_rag_context(query: str) -> tuple[str, bool]:
     """
     Search the knowledge base and return (context_text, found_results).
-    Uses vector search + keyword fallback to handle analytical/comparative questions.
+    Searches all sources globally, then applies source-diversity balancing so that
+    no single source dominates the context when multiple sites cover the same topic.
     """
-    SIMILARITY_THRESHOLD = 0.3  # filter out chunks with very low relevance
-    MATCH_COUNT = 15             # retrieve more candidates so threshold still leaves enough
+    SIMILARITY_THRESHOLD = 0.3
+    FETCH_COUNT = 25   # fetch more candidates to have room for diversity balancing
+    FINAL_COUNT = 20   # max chunks passed to the model
+    CHUNKS_PER_SOURCE = 4  # guaranteed slots per source in the final context
 
     try:
         supabase = get_supabase_client()
 
-        # 1. Primary vector search with rewritten query for better embedding match
+        # 1. Primary vector search with rewritten query
         rewritten = _rewrite_query_for_embedding(query)
-        results = search_documents(supabase, rewritten, match_count=MATCH_COUNT)
+        results = search_documents(supabase, rewritten, match_count=FETCH_COUNT)
 
-        # Also search with the original query and merge results
+        # Also search with the original query and merge
         if rewritten.lower() != query.lower():
-            orig_results = search_documents(supabase, query, match_count=MATCH_COUNT)
+            orig_results = search_documents(supabase, query, match_count=FETCH_COUNT)
             seen_ids = {r.get("id") for r in results}
             for r in orig_results:
                 if r.get("id") not in seen_ids:
                     results.append(r)
 
-        # 2. Keyword fallback — extract meaningful words (3+ chars, not stopwords)
+        # 2. Keyword fallback
         stopwords = {"what", "does", "this", "that", "with", "from", "have", "been",
                      "besides", "exist", "there", "compare", "other", "about", "which",
                      "would", "could", "should", "their", "these", "those", "than"}
-        keywords = [
-            w for w in re.findall(r"[a-zA-Z]{3,}", query)
-            if w.lower() not in stopwords
-        ]
+        keywords = [w for w in re.findall(r"[a-zA-Z]{3,}", query) if w.lower() not in stopwords]
         if keywords:
-            # Search with the most distinctive keywords joined as a phrase
-            keyword_query = " ".join(keywords[:6])
-            kw_results = search_documents(supabase, keyword_query, match_count=MATCH_COUNT)
+            kw_results = search_documents(supabase, " ".join(keywords[:6]), match_count=FETCH_COUNT)
             seen_ids = {r.get("id") for r in results}
             for r in kw_results:
                 if r.get("id") not in seen_ids:
@@ -448,25 +564,76 @@ def get_rag_context(query: str) -> tuple[str, bool]:
 
         # 3. Broad-query fallback for "top news / latest" style questions
         broad_keywords = {"top", "latest", "recent", "news", "headlines", "stories", "today"}
-        query_words = set(query.lower().split())
-        if query_words & broad_keywords:
+        if set(query.lower().split()) & broad_keywords:
             extra = search_documents(supabase, "latest news articles headlines", match_count=8)
             seen_ids = {r.get("id") for r in results}
             for r in extra:
                 if r.get("id") not in seen_ids:
                     results.append(r)
 
-        # 4. Filter by similarity threshold and sort best-first
+        # 4. Drop index/profile chunks — they contain only headlines or metadata,
+        #    not article body text, so they produce misleading "no content" answers.
+        _INDEX_TYPES = {"featured_stories", "site_profile", "article_index"}
+        results = [
+            r for r in results
+            if (r.get("metadata") or {}).get("type", "page") not in _INDEX_TYPES
+        ]
+
+        # Filter by similarity threshold, sort best-first
         results = [r for r in results if (r.get("similarity") or 0) >= SIMILARITY_THRESHOLD]
         results.sort(key=lambda r: r.get("similarity") or 0, reverse=True)
-        results = results[:MATCH_COUNT]  # cap final context size
+
+        # 5. Full-text fallback — when vector search finds nothing, search the DB
+        #    directly for rows containing the query's key terms. This catches specific
+        #    named entities, non-ASCII names, and unusual words that don't embed well.
+        if not results and keywords:
+            try:
+                # Use the longest keywords (most distinctive) for the text search
+                search_terms = sorted(keywords, key=len, reverse=True)[:3]
+                ft_results = []
+                seen_ft_ids: set = set()
+                for term in search_terms:
+                    rows = (
+                        supabase.table("crawled_pages")
+                        .select("id, url, chunk_number, content, metadata, source_id")
+                        .ilike("content", f"%{term}%")
+                        .limit(10)
+                        .execute()
+                        .data
+                    )
+                    for row in rows:
+                        rid = row.get("id")
+                        meta_type = (row.get("metadata") or {}).get("type", "page")
+                        if rid not in seen_ft_ids and meta_type not in _INDEX_TYPES:
+                            seen_ft_ids.add(rid)
+                            row["similarity"] = 0.0  # no similarity score for text matches
+                            ft_results.append(row)
+                if ft_results:
+                    print(f"[rag] vector search empty — full-text fallback found {len(ft_results)} results")
+                    results = ft_results
+            except Exception as ft_err:
+                print(f"[rag] full-text fallback error: {ft_err}")
 
         if not results:
             return "", False
 
-        # Include source URL with each chunk so the model knows where content came from
-        parts = []
+        # 5. Source-diversity cap:
+        #    Walk results best-first and include a chunk only if its source hasn't
+        #    already filled its cap. This prevents one dominant source from taking
+        #    all slots, but never forces in irrelevant chunks just to represent a source.
+        MAX_CHUNKS_PER_SOURCE = 5
+        source_counts: dict[str, int] = {}
+        balanced: list = []
         for r in results:
+            sid = r.get("source_id", "unknown")
+            if source_counts.get(sid, 0) < MAX_CHUNKS_PER_SOURCE:
+                balanced.append(r)
+                source_counts[sid] = source_counts.get(sid, 0) + 1
+            if len(balanced) >= FINAL_COUNT:
+                break
+
+        parts = []
+        for r in balanced:
             url = r.get("url", "")
             content = r.get("content", "")
             if content:
@@ -517,7 +684,16 @@ def build_messages_with_rag(messages: List[Message]) -> List[dict]:
             "'I don't have enough information about this in the knowledge base.'\n"
             "- Never invent quotes, statistics, names, or facts not present in the context.\n"
             "- When referring to people or events, use only the descriptions in the context — "
-            "do not apply your own knowledge of their current role or status.\n\n"
+            "do not apply your own knowledge of their current role or status.\n"
+            "- When the context contains coverage of the same topic from multiple sources, "
+            "synthesize all perspectives into a single combined answer. Note where sources "
+            "agree, and explicitly highlight any differences in framing, emphasis, or detail "
+            "between them.\n"
+            "- ALWAYS end your response with a small sources section in this exact format — "
+            "a plain text line '**Sources:**' (not a heading) followed by a markdown list where "
+            "each item is the article title as a clickable link, e.g. `- [Article Title](url)`. "
+            "Only include URLs that actually appear in the context below. "
+            "Do not include this section if no context was found.\n\n"
             f"Indexed sources: {sources_list}\n"
         )
         if context:
@@ -658,6 +834,7 @@ def list_sources():
         for source in sources:
             sid = source["source_id"]
             source["page_count"] = len(page_counts.get(sid, set()))
+            source["is_crawling"] = sid in _crawling_sources
 
         return {"sources": sources}
     except Exception as e:
@@ -673,6 +850,23 @@ def delete_source(source_id: str):
         supabase.table("code_examples").delete().eq("source_id", source_id).execute()
         supabase.table("sources").delete().eq("source_id", source_id).execute()
         return {"success": True, "deleted": source_id}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/sources/{source_id}/recrawl")
+async def recrawl_source(source_id: str):
+    """Trigger an immediate recrawl of a source."""
+    if source_id in _crawling_sources:
+        return {"success": False, "error": f"{source_id} is already being crawled"}
+    try:
+        supabase = get_supabase_client()
+        row = supabase.table("sources").select("url").eq("source_id", source_id).execute().data
+        if not row:
+            return {"success": False, "error": "Source not found"}
+        crawl_url = (row[0].get("url") or "").strip() or f"https://{source_id}"
+        asyncio.create_task(crawl_and_store(crawl_url, max_pages=MAX_PAGES_DEFAULT, is_recrawl=True))
+        return {"success": True, "message": f"Recrawl of {source_id} started from {crawl_url}"}
     except Exception as e:
         return {"success": False, "error": str(e)}
 
