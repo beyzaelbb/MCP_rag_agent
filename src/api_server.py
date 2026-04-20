@@ -29,7 +29,7 @@ from utils import (
     add_documents_to_supabase, update_source_info, extract_source_summary
 )
 
-openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+openai_client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY", "placeholder"))
 MODEL = os.getenv("MODEL_CHOICE", "gpt-4o-mini")
 RAG_MODEL_ID = "crawl4ai-rag"
 RECRAWL_INTERVAL_HOURS = 24
