@@ -11,7 +11,14 @@
 
 
 - recrawl 24 hr +
-- cache like search on site if needed
+- cache like search on site if needed +
 - multiple sites needs source = mashed +
 
+== done
 
+
+- adding metadata +
+- soft threashold fix +
+
+
+== done

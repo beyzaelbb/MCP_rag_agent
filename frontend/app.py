@@ -14,7 +14,7 @@ def api_get(path: str, **kwargs) -> requests.Response | None:
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return requests.get(f"{API_URL}{path}", **kwargs)
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY)
     return None
@@ -25,7 +25,7 @@ def api_post(path: str, **kwargs) -> requests.Response | None:
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return requests.post(f"{API_URL}{path}", **kwargs)
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY)
     return None
@@ -36,7 +36,7 @@ def api_delete(path: str, **kwargs) -> requests.Response | None:
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return requests.delete(f"{API_URL}{path}", **kwargs)
-        except requests.exceptions.ConnectionError:
+        except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
             if attempt < RETRY_ATTEMPTS - 1:
                 time.sleep(RETRY_DELAY)
     return None
@@ -195,7 +195,6 @@ with st.sidebar:
                 next_crawl_at = source.get("next_crawl_at")
                 is_crawling = source.get("is_crawling", False)
 
-                # Format next recrawl time for display
                 if is_crawling:
                     crawl_badge = "🔄 Crawling now…"
                 elif next_crawl_at:
@@ -226,7 +225,7 @@ with st.sidebar:
 
                     col_del, col_recrawl = st.columns([1, 1])
                     with col_del:
-                        if st.button(f"🗑 Delete entire source", key=f"del_{sid}", type="secondary", use_container_width=True):
+                        if st.button("🗑 Delete entire source", key=f"del_{sid}", type="secondary", use_container_width=True):
                             with st.spinner(f"Deleting {sid} …"):
                                 del_resp = api_delete(f"/sources/{sid}", timeout=15)
                                 if del_resp is None:
@@ -237,9 +236,8 @@ with st.sidebar:
                                 else:
                                     st.error(del_resp.json().get("error", "Unknown error"))
                     with col_recrawl:
-                        recrawl_disabled = is_crawling
                         recrawl_label = "🔄 Crawling…" if is_crawling else "🔄 Recrawl Now"
-                        if st.button(recrawl_label, key=f"recrawl_{sid}", use_container_width=True, disabled=recrawl_disabled):
+                        if st.button(recrawl_label, key=f"recrawl_{sid}", use_container_width=True, disabled=is_crawling):
                             resp = api_post(f"/sources/{sid}/recrawl", timeout=10)
                             if resp is None:
                                 backend_offline_msg()
@@ -283,11 +281,6 @@ with st.sidebar:
                                     else:
                                         st.error(dr.json().get("error", "Error"))
                             st.divider()
-
-        # Auto-refresh only while at least one source is being crawled
-        if any(s.get("is_crawling") for s in sources):
-            time.sleep(3)
-            st.rerun()
 
 
 # ── Main chat area ────────────────────────────────────────────────────────────

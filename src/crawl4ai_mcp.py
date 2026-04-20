@@ -355,10 +355,10 @@ def smart_chunk_markdown(text: str, chunk_size: int = 5000) -> List[str]:
 def extract_section_info(chunk: str) -> Dict[str, Any]:
     """
     Extracts headers and stats from a chunk.
-    
+
     Args:
         chunk: Markdown chunk
-        
+
     Returns:
         Dictionary with headers and stats
     """
@@ -370,6 +370,87 @@ def extract_section_info(chunk: str) -> Dict[str, Any]:
         "char_count": len(chunk),
         "word_count": len(chunk.split())
     }
+
+
+def extract_page_metadata(html: str, url: str) -> Dict[str, Any]:
+    """
+    Extracts article metadata (title, author, published date, description) from raw HTML.
+    Checks Open Graph, schema.org, and common meta tag patterns.
+    """
+    meta: Dict[str, Any] = {}
+
+    # --- published date ---
+    date_patterns = [
+        r'<meta[^>]+property=["\']article:published_time["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']article:published_time["\']',
+        r'<meta[^>]+name=["\'](?:pubdate|publish_date|date|publication_date|article:published)["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\'](?:pubdate|publish_date|date|publication_date)["\']',
+        r'"datePublished"\s*:\s*"([^"]+)"',
+        r'"publishedAt"\s*:\s*"([^"]+)"',
+        r'<time[^>]+datetime=["\']([^"\']+)["\']',
+    ]
+    for pattern in date_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            meta["published_date"] = m.group(1).strip()
+            break
+
+    # Fall back to date in URL path — handles /2024/03/15/ and /2024/apr/15/ styles
+    if "published_date" not in meta:
+        _MONTH_MAP = {
+            "jan": "01", "feb": "02", "mar": "03", "apr": "04", "may": "05", "jun": "06",
+            "jul": "07", "aug": "08", "sep": "09", "oct": "10", "nov": "11", "dec": "12",
+        }
+        m = re.search(r'/(\d{4})[/-](\d{2})[/-](\d{2})', url)
+        if m:
+            meta["published_date"] = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+        else:
+            m = re.search(r'/(\d{4})[/-](jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[/-](\d{1,2})', url, re.IGNORECASE)
+            if m:
+                month_num = _MONTH_MAP[m.group(2).lower()]
+                meta["published_date"] = f"{m.group(1)}-{month_num}-{m.group(3).zfill(2)}"
+
+    # --- title ---
+    title_patterns = [
+        r'<meta[^>]+property=["\']og:title["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:title["\']',
+        r'"headline"\s*:\s*"([^"]+)"',
+        r'<title[^>]*>([^<]+)</title>',
+    ]
+    for pattern in title_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            meta["title"] = m.group(1).strip()
+            break
+
+    # --- author ---
+    author_patterns = [
+        r'<meta[^>]+name=["\']author["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']author["\']',
+        r'<meta[^>]+property=["\']article:author["\'][^>]+content=["\']([^"\']+)["\']',
+        r'"author"\s*:\s*\{[^}]*"name"\s*:\s*"([^"]+)"',
+        r'"author"\s*:\s*"([^"]+)"',
+    ]
+    for pattern in author_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            meta["author"] = m.group(1).strip()
+            break
+
+    # --- description ---
+    desc_patterns = [
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:description["\']',
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']+)["\']',
+        r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']description["\']',
+    ]
+    for pattern in desc_patterns:
+        m = re.search(pattern, html, re.IGNORECASE)
+        if m:
+            meta["description"] = m.group(1).strip()
+            break
+
+    return meta
 
 def process_code_example(args):
     """
@@ -415,28 +496,32 @@ async def crawl_single_page(ctx: Context, url: str) -> str:
             # Extract source_id
             parsed_url = urlparse(url)
             source_id = parsed_url.netloc or parsed_url.path
-            
+
+            # Extract page-level metadata (title, author, published_date, description)
+            page_meta = extract_page_metadata(result.html or "", url)
+
             # Chunk the content
             chunks = smart_chunk_markdown(result.markdown)
-            
+
             # Prepare data for Supabase
             urls = []
             chunk_numbers = []
             contents = []
             metadatas = []
             total_word_count = 0
-            
+
             for i, chunk in enumerate(chunks):
                 urls.append(url)
                 chunk_numbers.append(i)
                 contents.append(chunk)
-                
+
                 # Extract metadata
                 meta = extract_section_info(chunk)
                 meta["chunk_index"] = i
                 meta["url"] = url
                 meta["source"] = source_id
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                meta.update(page_meta)
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -598,22 +683,23 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
         for doc in crawl_results:
             source_url = doc['url']
             md = doc['markdown']
+            page_meta = doc.get('page_meta', {})
             chunks = smart_chunk_markdown(md, chunk_size=chunk_size)
-            
+
             # Extract source_id
             parsed_url = urlparse(source_url)
             source_id = parsed_url.netloc or parsed_url.path
-            
+
             # Store content for source summary generation
             if source_id not in source_content_map:
                 source_content_map[source_id] = md[:5000]  # Store first 5000 chars
                 source_word_counts[source_id] = 0
-            
+
             for i, chunk in enumerate(chunks):
                 urls.append(source_url)
                 chunk_numbers.append(i)
                 contents.append(chunk)
-                
+
                 # Extract metadata
                 meta = extract_section_info(chunk)
                 meta["chunk_index"] = i
@@ -621,6 +707,7 @@ async def smart_crawl_url(ctx: Context, url: str, max_depth: int = 3, max_concur
                 meta["source"] = source_id
                 meta["crawl_type"] = crawl_type
                 meta["crawl_time"] = str(asyncio.current_task().get_coro().__name__)
+                meta.update(page_meta)
                 metadatas.append(meta)
                 
                 # Accumulate word count
@@ -1763,7 +1850,8 @@ async def crawl_markdown_file(crawler: AsyncWebCrawler, url: str) -> List[Dict[s
 
     result = await crawler.arun(url=url, config=crawl_config)
     if result.success and result.markdown:
-        return [{'url': url, 'markdown': result.markdown}]
+        page_meta = extract_page_metadata(result.html or "", url)
+        return [{'url': url, 'markdown': result.markdown, 'page_meta': page_meta}]
     else:
         print(f"Failed to crawl {url}: {result.error_message}")
         return []
@@ -1788,7 +1876,10 @@ async def crawl_batch(crawler: AsyncWebCrawler, urls: List[str], max_concurrent:
     )
 
     results = await crawler.arun_many(urls=urls, config=crawl_config, dispatcher=dispatcher)
-    return [{'url': r.url, 'markdown': r.markdown} for r in results if r.success and r.markdown]
+    return [
+        {'url': r.url, 'markdown': r.markdown, 'page_meta': extract_page_metadata(r.html or "", r.url)}
+        for r in results if r.success and r.markdown
+    ]
 
 async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: List[str], max_depth: int = 3, max_concurrent: int = 10) -> List[Dict[str, Any]]:
     """
@@ -1831,7 +1922,8 @@ async def crawl_recursive_internal_links(crawler: AsyncWebCrawler, start_urls: L
             visited.add(norm_url)
 
             if result.success and result.markdown:
-                results_all.append({'url': result.url, 'markdown': result.markdown})
+                page_meta = extract_page_metadata(result.html or "", result.url)
+                results_all.append({'url': result.url, 'markdown': result.markdown, 'page_meta': page_meta})
                 for link in result.links.get("internal", []):
                     next_url = normalize_url(link["href"])
                     if next_url not in visited:

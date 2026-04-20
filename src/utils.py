@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 import openai
 import re
 import time
+from datetime import datetime, timezone
 
 # ── OpenAI client ──
 openai.api_key = os.getenv("OPENAI_API_KEY")
@@ -363,6 +364,7 @@ def add_documents_to_supabase(
                 "content": contextual_contents[j],  # Store original content
                 "metadata": {
                     "chunk_size": chunk_size,
+                    "crawled_at": datetime.now(timezone.utc).isoformat(),
                     **batch_metadatas[j]
                 },
                 "source_id": source_id,  # Add source_id field

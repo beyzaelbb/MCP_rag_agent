@@ -59,6 +59,20 @@ async def auto_recrawl_scheduler() -> None:
     while True:
         try:
             supabase = get_supabase_client()
+
+            # Enroll any sources that have no schedule yet (indexed before recrawl feature)
+            unscheduled = (
+                supabase.table("sources")
+                .select("source_id")
+                .is_("next_crawl_at", "null")
+                .execute()
+                .data
+            )
+            for r in unscheduled:
+                sid = r["source_id"]
+                print(f"[scheduler] Enrolling {sid} in auto-recrawl schedule")
+                set_next_crawl(supabase, sid)
+
             # Find the soonest upcoming crawl
             row = (
                 supabase.table("sources")
@@ -89,14 +103,20 @@ async def auto_recrawl_scheduler() -> None:
                 .execute()
                 .data
             )
+            all_skipped = True
             for r in due_rows:
                 sid = r["source_id"]
                 crawl_url = (r.get("url") or "").strip() or f"https://{sid}"
                 if sid in _crawling_sources:
                     print(f"[scheduler] Skipping {sid} — already crawling")
                     continue
+                all_skipped = False
                 print(f"[scheduler] Recrawling {sid} from {crawl_url}")
                 asyncio.create_task(crawl_and_store(crawl_url, max_pages=MAX_PAGES_DEFAULT, is_recrawl=True))
+
+            # All due sources are still running — wait before re-checking to avoid spin
+            if due_rows and all_skipped:
+                await asyncio.sleep(60)
 
         except Exception as e:
             print(f"[scheduler] Error: {e}")
@@ -225,7 +245,14 @@ def extract_internal_links(result, base_url: str) -> List[tuple[str, str]]:
 async def crawl_single_page(crawler, url: str) -> tuple[str, list[tuple[str, str]]]:
     """Crawl one page, return (markdown_content, [(url, link_text), ...])."""
     from crawl4ai import CrawlerRunConfig, CacheMode
-    result = await crawler.arun(url=url, config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS))
+    try:
+        result = await asyncio.wait_for(
+            crawler.arun(url=url, config=CrawlerRunConfig(cache_mode=CacheMode.BYPASS, page_timeout=30000)),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        print(f"[crawl] Timeout fetching {url} — skipping")
+        return "", []
     if not result.success:
         print(f"[crawl] Failed: {url} — {result.error_message}")
         return "", []
@@ -513,9 +540,11 @@ def _rewrite_query_for_embedding(query: str) -> str:
         (r"^what (alternative )?explanations? (exist |are there )?for\b", ""),
         (r"^how does .+ compare (to|with)\b", "comparison of "),
         (r"^what (is|are|was|were) (the )?(main |key |primary )?", ""),
+        (r"^what (happened|occurred|took place) (to|with|at|in|after|during|when)\b", ""),
         (r"^how (did|does|do|was|were)\b", ""),
         (r"^why (did|does|do|was|were|is|are)\b", ""),
         (r"^(can you |please )?(explain|describe|tell me about|summarize)\b", ""),
+        (r"^(tell me|give me|show me) (what |about |the )?(details? of |story of |info (on|about) )?", ""),
     ]
     for pattern, replacement in rewrites:
         q = re.sub(pattern, replacement, q, flags=re.IGNORECASE).strip()
@@ -530,8 +559,11 @@ def get_rag_context(query: str) -> tuple[str, bool]:
     Searches all sources globally, then applies source-diversity balancing so that
     no single source dominates the context when multiple sites cover the same topic.
     """
-    SIMILARITY_THRESHOLD = 0.3
-    FETCH_COUNT = 25   # fetch more candidates to have room for diversity balancing
+    # For broad summarisation queries lower the threshold so more articles pass through
+    broad_summary = any(w in query.lower() for w in {"summarize", "summarise", "summary", "last 24", "today", "recent", "latest", "everything"})
+    SIMILARITY_THRESHOLD = 0.2 if broad_summary else 0.3
+    SIMILARITY_THRESHOLD_SOFT = 0.10  # relaxed threshold used before falling back to keyword search
+    FETCH_COUNT = 40 if broad_summary else 25   # fetch more candidates for summary queries
     FINAL_COUNT = 20   # max chunks passed to the model
     CHUNKS_PER_SOURCE = 4  # guaranteed slots per source in the final context
 
@@ -574,22 +606,76 @@ def get_rag_context(query: str) -> tuple[str, bool]:
         # 4. Drop index/profile chunks — they contain only headlines or metadata,
         #    not article body text, so they produce misleading "no content" answers.
         _INDEX_TYPES = {"featured_stories", "site_profile", "article_index"}
+        before_filter = len(results)
         results = [
             r for r in results
             if (r.get("metadata") or {}).get("type", "page") not in _INDEX_TYPES
         ]
+        print(f"[rag] raw results: {before_filter}, after index-type filter: {len(results)}")
 
-        # Filter by similarity threshold, sort best-first
-        results = [r for r in results if (r.get("similarity") or 0) >= SIMILARITY_THRESHOLD]
-        results.sort(key=lambda r: r.get("similarity") or 0, reverse=True)
+        # Log top raw scores so we can diagnose threshold issues
+        if results:
+            top_scores = sorted(
+                [r.get("similarity") or 0 for r in results], reverse=True
+            )[:5]
+            print(f"[rag] top similarity scores: {[round(s, 3) for s in top_scores]}")
+        else:
+            print("[rag] search_documents returned 0 results (embedding error or empty DB?)")
 
-        # 5. Full-text fallback — when vector search finds nothing, search the DB
-        #    directly for rows containing the query's key terms. This catches specific
-        #    named entities, non-ASCII names, and unusual words that don't embed well.
-        if not results and keywords:
+        # Filter by similarity threshold — try strict first, relax if nothing passes
+        strict = [r for r in results if (r.get("similarity") or 0) >= SIMILARITY_THRESHOLD]
+        if strict:
+            results = strict
+        else:
+            soft = [r for r in results if (r.get("similarity") or 0) >= SIMILARITY_THRESHOLD_SOFT]
+            if soft:
+                print(f"[rag] strict threshold ({SIMILARITY_THRESHOLD}) empty — soft threshold ({SIMILARITY_THRESHOLD_SOFT}) found {len(soft)} results")
+            else:
+                print(f"[rag] both thresholds empty — all scores below {SIMILARITY_THRESHOLD_SOFT}, falling back to full-text")
+            results = soft
+
+        # Recency boost: articles published (or crawled if no publish date) in the last
+        # 24 hours get a +0.15 score bump so they rank above older content.
+        now_utc = datetime.now(timezone.utc)
+        for r in results:
+            meta = r.get("metadata") or {}
+            published_date_str = meta.get("published_date")
+            crawled_at_str = meta.get("crawled_at")
+            ref_str = published_date_str or crawled_at_str
+            if ref_str:
+                try:
+                    ref_dt = datetime.fromisoformat(ref_str.replace("Z", "+00:00"))
+                    age_hours = (now_utc - ref_dt).total_seconds() / 3600
+                    if age_hours <= 24:
+                        r["_boosted_score"] = (r.get("similarity") or 0) + 0.15
+                    else:
+                        r["_boosted_score"] = r.get("similarity") or 0
+                except Exception:
+                    r["_boosted_score"] = r.get("similarity") or 0
+            else:
+                r["_boosted_score"] = r.get("similarity") or 0
+
+        results.sort(key=lambda r: r["_boosted_score"], reverse=True)
+
+        # 5. Full-text fallback — runs when vector search finds nothing OR only found
+        #    soft-threshold results (score < SIMILARITY_THRESHOLD). In the soft case we
+        #    merge full-text hits in rather than replacing, so the keyword-matched article
+        #    is included alongside the weak vector result.
+        used_soft = bool(results) and not strict
+        if (not results or used_soft) and keywords:
             try:
-                # Use the longest keywords (most distinctive) for the text search
-                search_terms = sorted(keywords, key=len, reverse=True)[:3]
+                # Exclude generic verbs/adverbs that appear in almost every article —
+                # they produce noisy matches and dilute the result set.
+                _GENERIC_WORDS = {
+                    "happened", "occurred", "said", "told", "added", "noted", "stated",
+                    "according", "after", "before", "during", "while", "also", "just",
+                    "still", "already", "then", "when", "because", "however", "although",
+                }
+                topic_keywords = [k for k in keywords if k.lower() not in _GENERIC_WORDS]
+                # Fall back to all keywords if filtering left nothing
+                search_terms_pool = topic_keywords if topic_keywords else keywords
+                # Prefer longer (more distinctive) terms, take up to 4
+                search_terms = sorted(search_terms_pool, key=len, reverse=True)[:4]
                 ft_results = []
                 seen_ft_ids: set = set()
                 for term in search_terms:
@@ -606,11 +692,25 @@ def get_rag_context(query: str) -> tuple[str, bool]:
                         meta_type = (row.get("metadata") or {}).get("type", "page")
                         if rid not in seen_ft_ids and meta_type not in _INDEX_TYPES:
                             seen_ft_ids.add(rid)
-                            row["similarity"] = 0.0  # no similarity score for text matches
+                            row["similarity"] = 0.0
                             ft_results.append(row)
                 if ft_results:
-                    print(f"[rag] vector search empty — full-text fallback found {len(ft_results)} results")
-                    results = ft_results
+                    # Rank by how many distinct search terms appear in the content —
+                    # chunks that match more keywords are more likely to be the right article.
+                    all_terms_lower = [t.lower() for t in search_terms_pool]
+                    for row in ft_results:
+                        content_lower = (row.get("content") or "").lower()
+                        row["_ft_score"] = sum(1 for t in all_terms_lower if t in content_lower)
+                    ft_results.sort(key=lambda r: r["_ft_score"], reverse=True)
+                    if used_soft:
+                        # Merge: keep soft vector results, add full-text hits not already present
+                        existing_ids = {r.get("id") for r in results}
+                        added = [r for r in ft_results if r.get("id") not in existing_ids]
+                        results.extend(added)
+                        print(f"[rag] soft-threshold vector + full-text fallback: {len(results)} total results ({len(added)} from full-text)")
+                    else:
+                        print(f"[rag] vector search empty — full-text fallback found {len(ft_results)} results")
+                        results = ft_results
             except Exception as ft_err:
                 print(f"[rag] full-text fallback error: {ft_err}")
 
@@ -632,12 +732,49 @@ def get_rag_context(query: str) -> tuple[str, bool]:
             if len(balanced) >= FINAL_COUNT:
                 break
 
+        print(f"[rag] sending {len(balanced)} chunks to model: {[r.get('url','?') for r in balanced[:5]]}")
+
         parts = []
         for r in balanced:
             url = r.get("url", "")
             content = r.get("content", "")
-            if content:
-                parts.append(f"[Source: {url}]\n{content}")
+            if not content:
+                continue
+            meta = r.get("metadata") or {}
+
+            # Use published_date for recency when available; fall back to crawled_at
+            published_date_str = meta.get("published_date")
+            crawled_at_str = meta.get("crawled_at")
+
+            recency_label = "ARCHIVE"
+            if published_date_str:
+                try:
+                    pub_dt = datetime.fromisoformat(published_date_str.replace("Z", "+00:00"))
+                    age_hours = (now_utc - pub_dt).total_seconds() / 3600
+                    if age_hours <= 24:
+                        recency_label = "RECENT"
+                except Exception:
+                    pass
+            elif crawled_at_str:
+                try:
+                    crawled_dt = datetime.fromisoformat(crawled_at_str)
+                    age_hours = (now_utc - crawled_dt).total_seconds() / 3600
+                    if age_hours <= 24:
+                        recency_label = "RECENT"
+                except Exception:
+                    pass
+
+            # Build label line — include all available metadata so the model can answer
+            # questions like "when was this published?" or "who wrote this?"
+            label_parts = [recency_label, f"Source: {url}"]
+            if published_date_str:
+                label_parts.append(f"Published: {published_date_str}")
+            if meta.get("title"):
+                label_parts.append(f"Title: {meta['title']}")
+            if meta.get("author"):
+                label_parts.append(f"Author: {meta['author']}")
+
+            parts.append(f"[{' | '.join(label_parts)}]\n{content}")
 
         return "\n\n---\n\n".join(parts), True
     except Exception as e:
@@ -683,8 +820,22 @@ def build_messages_with_rag(messages: List[Message]) -> List[dict]:
             "- If the context does not contain enough information to answer, say exactly: "
             "'I don't have enough information about this in the knowledge base.'\n"
             "- Never invent quotes, statistics, names, or facts not present in the context.\n"
+            "- The knowledge base may contain information that is more current than your training data. "
+            "Whenever there is any conflict between what the context says and what you believe to be true "
+            "from training — including titles, roles, statuses, dates, or any other facts — "
+            "the context is always authoritative. Never silently correct or update what the context says.\n"
             "- When referring to people or events, use only the descriptions in the context — "
             "do not apply your own knowledge of their current role or status.\n"
+            "- Each context chunk is labeled [RECENT] or [ARCHIVE] based on the article's "
+            "publish date (or crawl date when no publish date is available). When the user asks "
+            "about 'latest', 'recent', 'today', or 'new' articles/news, prioritise [RECENT] "
+            "chunks. If there are RECENT chunks, lead with those. If there are also ARCHIVE "
+            "chunks, you may include them but clearly note they are older. Never refuse to answer "
+            "just because some chunks are ARCHIVE — summarise whatever is available and be clear "
+            "about what is recent vs older. "
+            "Each chunk may also include 'Published: <date>', 'Title: <title>', and "
+            "'Author: <name>' fields — use these when answering questions about when something "
+            "was published, who wrote it, or what the article is called.\n"
             "- When the context contains coverage of the same topic from multiple sources, "
             "synthesize all perspectives into a single combined answer. Note where sources "
             "agree, and explicitly highlight any differences in framing, emphasis, or detail "

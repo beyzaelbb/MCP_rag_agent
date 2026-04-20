@@ -103,6 +103,7 @@ These scripts support:
 - Source-level summaries stored per domain
 - Site profile and featured-story synthetic chunks added during deep crawl mode
 - First crawl replaces existing records; recrawls only add new pages — old articles are never deleted
+- Article metadata extraction: each crawled page extracts `published_date`, `title`, `author`, and `description` from Open Graph tags, schema.org JSON-LD, `<meta>` tags, and URL date patterns (including both `/2024/04/19/` and `/2024/apr/19/` formats); stored in the `metadata` JSONB column alongside each chunk
 
 ### Auto-recrawl scheduler
 
@@ -127,6 +128,9 @@ These scripts support:
 - Multi-source synthesis: when multiple sources cover the same topic the model is instructed to combine perspectives and highlight differences in framing or emphasis
 - Every answer ends with a `**Sources:**` section of clickable article links derived only from context actually used in the answer
 - OpenAI-backed answer generation constrained to indexed knowledge
+- Soft similarity threshold: if no results pass the strict 0.3 threshold, results above 0.1 are used and merged with full-text fallback hits so low-similarity but relevant articles are not silently dropped
+- Adaptive threshold for broad summary queries (“summarize”, “last 24 hours”, etc.) — threshold lowers to 0.2 and fetch count increases to retrieve more candidates
+- Recency boost: chunks published or crawled within the last 24 hours receive a +0.15 score bump so recent content ranks above older material on equal semantic footing
 
 ### Embedding cache
 
