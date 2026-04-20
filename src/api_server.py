@@ -1175,6 +1175,6 @@ async def chat_completions(request: ChatRequest, x_openai_key: Optional[str] = H
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("API_PORT", "8052"))
+    port = int(os.getenv("PORT", os.getenv("API_PORT", "8052")))
     print(f"Starting Crawl4AI RAG API on http://0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
