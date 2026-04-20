@@ -4,13 +4,19 @@ import json
 import time
 from datetime import datetime, timezone
 
-API_URL = "http://localhost:8052"
+API_URL = st.secrets.get("API_URL", "http://localhost:8052")
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 1.5  # seconds between retries
 
 
+def _auth_headers() -> dict:
+    key = st.session_state.get("openai_api_key", "").strip()
+    return {"X-OpenAI-Key": key} if key else {}
+
+
 def api_get(path: str, **kwargs) -> requests.Response | None:
     """GET with automatic retries. Returns None if all attempts fail."""
+    kwargs.setdefault("headers", {}).update(_auth_headers())
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return requests.get(f"{API_URL}{path}", **kwargs)
@@ -22,6 +28,7 @@ def api_get(path: str, **kwargs) -> requests.Response | None:
 
 def api_post(path: str, **kwargs) -> requests.Response | None:
     """POST with automatic retries. Returns None if all attempts fail."""
+    kwargs.setdefault("headers", {}).update(_auth_headers())
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return requests.post(f"{API_URL}{path}", **kwargs)
@@ -33,6 +40,7 @@ def api_post(path: str, **kwargs) -> requests.Response | None:
 
 def api_delete(path: str, **kwargs) -> requests.Response | None:
     """DELETE with automatic retries. Returns None if all attempts fail."""
+    kwargs.setdefault("headers", {}).update(_auth_headers())
     for attempt in range(RETRY_ATTEMPTS):
         try:
             return requests.delete(f"{API_URL}{path}", **kwargs)
@@ -64,6 +72,8 @@ if "active_title" not in st.session_state:
     st.session_state.active_title = "New Chat"
 if "sidebar_tab" not in st.session_state:
     st.session_state.sidebar_tab = "chats"  # "chats" or "sources"
+if "openai_api_key" not in st.session_state:
+    st.session_state.openai_api_key = ""
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -109,6 +119,18 @@ def new_chat():
 
 with st.sidebar:
     st.title("🕷️ Crawl4AI RAG")
+
+    st.session_state.openai_api_key = st.text_input(
+        "OpenAI API Key",
+        value=st.session_state.openai_api_key,
+        type="password",
+        placeholder="sk-...",
+        help="Your OpenAI API key. It is only stored in your browser session.",
+    )
+    if not st.session_state.openai_api_key.strip():
+        st.warning("Enter your OpenAI API key above to start chatting.")
+
+    st.divider()
 
     tab_chats, tab_sources = st.tabs(["💬 Chats", "🌐 Sources"])
 
@@ -324,6 +346,7 @@ else:
             try:
                 with requests.post(  # streaming requires raw requests (no wrapper)
                     f"{API_URL}/v1/chat/completions",
+                    headers=_auth_headers(),
                     json={
                         "model": "crawl4ai-rag",
                         "messages": st.session_state.messages,
@@ -357,6 +380,7 @@ else:
                 try:
                     with requests.post(
                         f"{API_URL}/v1/chat/completions",
+                        headers=_auth_headers(),
                         json={"model": "crawl4ai-rag", "messages": st.session_state.messages, "stream": False},
                         timeout=60,
                     ) as retry_resp:

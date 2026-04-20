@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional, Any
 from urllib.parse import urlparse
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, Header
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1091,11 +1091,20 @@ def list_models():
 
 
 @app.post("/v1/chat/completions")
-async def chat_completions(request: ChatRequest):
+async def chat_completions(request: ChatRequest, x_openai_key: Optional[str] = Header(default=None)):
     chat_id = f"chatcmpl-{uuid.uuid4().hex}"
     user_message = next(
         (m.content for m in reversed(request.messages) if m.role == "user"), ""
     )
+
+    api_key = x_openai_key or os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        from fastapi import HTTPException
+        raise HTTPException(status_code=400, detail="OpenAI API key is required. Provide it via the X-OpenAI-Key header.")
+
+    client = openai.OpenAI(api_key=api_key)
+    import openai as _openai_module
+    _openai_module.api_key = api_key  # used by utils.py embedding calls
 
     # Handle crawl requests before passing to OpenAI
     if is_crawl_intent(user_message):
@@ -1111,7 +1120,7 @@ async def chat_completions(request: ChatRequest):
     if request.stream:
         def generate():
             created = int(time.time())
-            stream = openai_client.chat.completions.create(
+            stream = client.chat.completions.create(
                 model=MODEL,
                 messages=augmented_messages,
                 stream=True,
@@ -1138,7 +1147,7 @@ async def chat_completions(request: ChatRequest):
 
         return StreamingResponse(generate(), media_type="text/event-stream")
 
-    response = openai_client.chat.completions.create(
+    response = client.chat.completions.create(
         model=MODEL,
         messages=augmented_messages,
         temperature=request.temperature,
