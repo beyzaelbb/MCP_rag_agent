@@ -7,6 +7,8 @@ import re
 import json
 import time
 import uuid
+import glob
+import shutil
 import asyncio
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone, timedelta
@@ -191,6 +193,27 @@ SKIP_URL_PATTERNS = re.compile(
 
 def should_skip_url(url: str) -> bool:
     return bool(SKIP_URL_PATTERNS.search(urlparse(url).path))
+
+
+def _cleanup_browser_temp_files() -> None:
+    """Delete Playwright/Chromium temp dirs left behind after a crawl session."""
+    patterns = [
+        "/tmp/.org.chromium.*",
+        "/tmp/playwright*",
+        "/tmp/.com.google.Chrome*",
+        "/tmp/chromium*",
+        os.path.expanduser("~/.crawl4ai/cache"),
+        os.path.expanduser("~/.config/chromium/Crash Reports"),
+    ]
+    for pattern in patterns:
+        for path in glob.glob(pattern):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.remove(path)
+            except Exception:
+                pass
 
 
 def url_priority(url: str) -> int:
@@ -385,6 +408,7 @@ async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT, is_recra
                     all_metadatas.append({"source": current_url, "source_id": source_id})
 
         pages_crawled = new_pages_crawled
+        _cleanup_browser_temp_files()
 
         if not all_chunks:
             return f"No content extracted from {url}"
