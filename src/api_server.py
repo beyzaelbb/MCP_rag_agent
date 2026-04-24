@@ -39,6 +39,20 @@ RECRAWL_INTERVAL_HOURS = 24
 # Track which sources are currently being (re)crawled to avoid duplicate jobs
 _crawling_sources: set[str] = set()
 
+# One crawl at a time — multiple simultaneous Chromium instances exhaust RAM on cloud hosts.
+_CRAWL_SEMAPHORE = asyncio.Semaphore(1)
+
+# Chromium flags required inside Docker/cloud containers.
+# --disable-dev-shm-usage: Docker's /dev/shm is 64 MB by default; Chrome crashes without this.
+# --no-sandbox / --disable-setuid-sandbox: required in restricted container namespaces.
+_BROWSER_ARGS = [
+    "--no-sandbox",
+    "--disable-setuid-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--no-zygote",
+]
+
 
 def set_next_crawl(supabase, source_id: str) -> None:
     """Set next_crawl_at to 24 hours from now for the given source."""
@@ -290,188 +304,190 @@ async def crawl_and_store(url: str, max_pages: int = MAX_PAGES_DEFAULT, is_recra
     When is_recrawl=True, existing articles are preserved and only new URLs are added.
     """
     source_id = urlparse(url).netloc
+    # Mark as crawling immediately so the scheduler won't queue a duplicate while
+    # this task waits on the semaphore for another crawl to finish.
     _crawling_sources.add(source_id)
-    try:
-        from crawl4ai import AsyncWebCrawler, BrowserConfig
-        supabase = get_supabase_client()
-        source_id = urlparse(url).netloc
+    async with _CRAWL_SEMAPHORE:
+        try:
+            from crawl4ai import AsyncWebCrawler, BrowserConfig
+            supabase = get_supabase_client()
+            source_id = urlparse(url).netloc
 
-        # For recrawls, pre-load every URL already in the DB for this source.
-        # We add them to `visited` so the crawl loop skips them entirely —
-        # no fetching, no embedding, no wasted API calls.
-        # The root URL is excluded so we still crawl the homepage to discover new links.
-        if is_recrawl:
-            try:
-                existing_rows = (
-                    supabase.table("crawled_pages")
-                    .select("url")
-                    .eq("source_id", source_id)
-                    .execute()
-                    .data
-                )
-                already_crawled = {row["url"] for row in existing_rows} - {url}
-                print(f"[crawl] Recrawl: skipping {len(already_crawled)} already-indexed URLs")
-            except Exception as e:
-                print(f"[crawl] Could not fetch existing URLs: {e}")
+            # For recrawls, pre-load every URL already in the DB for this source.
+            # We add them to `visited` so the crawl loop skips them entirely —
+            # no fetching, no embedding, no wasted API calls.
+            # The root URL is excluded so we still crawl the homepage to discover new links.
+            if is_recrawl:
+                try:
+                    existing_rows = (
+                        supabase.table("crawled_pages")
+                        .select("url")
+                        .eq("source_id", source_id)
+                        .execute()
+                        .data
+                    )
+                    already_crawled = {row["url"] for row in existing_rows} - {url}
+                    print(f"[crawl] Recrawl: skipping {len(already_crawled)} already-indexed URLs")
+                except Exception as e:
+                    print(f"[crawl] Could not fetch existing URLs: {e}")
+                    already_crawled = set()
+            else:
                 already_crawled = set()
-        else:
-            already_crawled = set()
 
-        visited: set[str] = already_crawled.copy()
-        # Two-section queue:
-        #   homepage_queue — links found on the root page, kept in page order (top story first)
-        #   deep_queue     — links found on subpages, sorted by priority
-        homepage_queue: list[tuple[str, str]] = [(url, "")]
-        deep_queue: list[tuple[str, str]] = []
-        all_urls: list[str] = []
-        all_chunks: list[str] = []
-        all_chunk_numbers: list[int] = []
-        all_metadatas: list[dict] = []
-        url_to_full_doc: dict[str, str] = {}
-        total_words = 0
-        first_content = ""
-        homepage_stories: list[tuple[str, str]] = []
-        is_root = True
+            visited: set[str] = already_crawled.copy()
+            # Two-section queue:
+            #   homepage_queue — links found on the root page, kept in page order (top story first)
+            #   deep_queue     — links found on subpages, sorted by priority
+            homepage_queue: list[tuple[str, str]] = [(url, "")]
+            deep_queue: list[tuple[str, str]] = []
+            all_urls: list[str] = []
+            all_chunks: list[str] = []
+            all_chunk_numbers: list[int] = []
+            all_metadatas: list[dict] = []
+            url_to_full_doc: dict[str, str] = {}
+            total_words = 0
+            first_content = ""
+            homepage_stories: list[tuple[str, str]] = []
+            is_root = True
 
-        def next_url() -> tuple[str, str] | None:
-            """Always drain homepage queue first (page order), then deep queue."""
-            if homepage_queue:
-                return homepage_queue.pop(0)
-            if deep_queue:
-                return deep_queue.pop(0)
-            return None
+            def next_url() -> tuple[str, str] | None:
+                if homepage_queue:
+                    return homepage_queue.pop(0)
+                if deep_queue:
+                    return deep_queue.pop(0)
+                return None
 
-        def queued_urls() -> set[str]:
-            return {u for u, _ in homepage_queue} | {u for u, _ in deep_queue}
+            def queued_urls() -> set[str]:
+                return {u for u, _ in homepage_queue} | {u for u, _ in deep_queue}
 
-        print(f"[crawl] Starting {'re' if is_recrawl else ''}crawl of {url} (max {max_pages} new pages)")
+            print(f"[crawl] Starting {'re' if is_recrawl else ''}crawl of {url} (max {max_pages} new pages)")
 
-        new_pages_crawled = 0
-        async with AsyncWebCrawler(config=BrowserConfig(headless=True)) as crawler:
-            while new_pages_crawled < max_pages:
-                item = next_url()
-                if item is None:
-                    break
-                current_url, _ = item
-                if current_url in visited:
-                    continue
-                visited.add(current_url)
-                new_pages_crawled += 1
+            new_pages_crawled = 0
+            async with AsyncWebCrawler(config=BrowserConfig(headless=True, extra_args=_BROWSER_ARGS)) as crawler:
+                while new_pages_crawled < max_pages:
+                    item = next_url()
+                    if item is None:
+                        break
+                    current_url, _ = item
+                    if current_url in visited:
+                        continue
+                    visited.add(current_url)
+                    new_pages_crawled += 1
 
-                print(f"[crawl] ({len(visited)}/{max_pages}) {current_url}")
-                content, links = await crawl_single_page(crawler, current_url)
+                    print(f"[crawl] ({len(visited)}/{max_pages}) {current_url}")
+                    content, links = await crawl_single_page(crawler, current_url)
 
-                # On the root page: article links (real headlines) go into homepage_queue
-                # IN PAGE ORDER. Non-article links (short text, nav) go to deep_queue.
-                if is_root:
-                    is_root = False
-                    for link_url, link_text in links:
-                        if should_skip_url(link_url) or link_url in visited:
-                            continue
-                        clean_text = link_text.strip()
-                        # A real article headline: long text with spaces (not a nav label)
-                        is_article_link = len(clean_text) > 25 and " " in clean_text
-                        if is_article_link:
-                            homepage_queue.append((link_url, clean_text))
-                            homepage_stories.append((link_url, clean_text))
-                        else:
-                            deep_queue.append((link_url, clean_text))
+                    # On the root page: article links (real headlines) go into homepage_queue
+                    # IN PAGE ORDER. Non-article links (short text, nav) go to deep_queue.
+                    if is_root:
+                        is_root = False
+                        for link_url, link_text in links:
+                            if should_skip_url(link_url) or link_url in visited:
+                                continue
+                            clean_text = link_text.strip()
+                            # A real article headline: long text with spaces (not a nav label)
+                            is_article_link = len(clean_text) > 25 and " " in clean_text
+                            if is_article_link:
+                                homepage_queue.append((link_url, clean_text))
+                                homepage_stories.append((link_url, clean_text))
+                            else:
+                                deep_queue.append((link_url, clean_text))
 
-                # Skip low-content pages
-                min_chars = 50 if current_url == url else 300
-                if not content or len(content.strip()) < min_chars:
-                    print(f"[crawl] Skipping low-content page: {current_url} ({len(content)} chars)")
-                    continue
+                    # Skip low-content pages
+                    min_chars = 50 if current_url == url else 300
+                    if not content or len(content.strip()) < min_chars:
+                        print(f"[crawl] Skipping low-content page: {current_url} ({len(content)} chars)")
+                        continue
 
-                if not first_content:
-                    first_content = content
+                    if not first_content:
+                        first_content = content
 
-                # Links from subpages go into deep_queue, sorted by priority
-                already_queued = queued_urls()
-                new_links = [
-                    (lu, lt) for lu, lt in links
-                    if lu not in visited and lu not in already_queued and not should_skip_url(lu)
-                ]
-                deep_queue.extend(new_links)
-                deep_queue.sort(key=lambda x: url_priority(x[0]))
+                    # Links from subpages go into deep_queue, sorted by priority
+                    already_queued = queued_urls()
+                    new_links = [
+                        (lu, lt) for lu, lt in links
+                        if lu not in visited and lu not in already_queued and not should_skip_url(lu)
+                    ]
+                    deep_queue.extend(new_links)
+                    deep_queue.sort(key=lambda x: url_priority(x[0]))
 
-                # Chunk the page content
-                chunk_size = 5000
-                page_chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
-                url_to_full_doc[current_url] = content
-                total_words += len(content.split())
+                    # Chunk the page content
+                    chunk_size = 5000
+                    page_chunks = [content[i:i+chunk_size] for i in range(0, len(content), chunk_size)]
+                    url_to_full_doc[current_url] = content
+                    total_words += len(content.split())
 
-                for i, chunk in enumerate(page_chunks):
-                    all_urls.append(current_url)
-                    all_chunk_numbers.append(i)
-                    all_chunks.append(chunk)
-                    all_metadatas.append({"source": current_url, "source_id": source_id})
+                    for i, chunk in enumerate(page_chunks):
+                        all_urls.append(current_url)
+                        all_chunk_numbers.append(i)
+                        all_chunks.append(chunk)
+                        all_metadatas.append({"source": current_url, "source_id": source_id})
 
-        pages_crawled = new_pages_crawled
-        _cleanup_browser_temp_files()
+            pages_crawled = new_pages_crawled
+            _cleanup_browser_temp_files()
 
-        if not all_chunks:
-            return f"No content extracted from {url}"
+            if not all_chunks:
+                return f"No content extracted from {url}"
 
-        # ── Site profile chunk ──────────────────────────────────────────────
-        # Tells the agent what this source is so it can answer cross-source questions.
-        site_summary = extract_source_summary(source_id, first_content[:5000])
-        site_profile = (
-            f"SITE PROFILE: {source_id}\n"
-            f"Description: {site_summary}\n"
-            f"Total articles indexed: {len(set(all_urls))}\n"
-            f"Source URL: {url}"
-        )
-        all_urls.insert(0, url)
-        all_chunk_numbers.insert(0, 9998)
-        all_chunks.insert(0, site_profile)
-        all_metadatas.insert(0, {"source": url, "source_id": source_id, "type": "site_profile"})
+            # ── Site profile chunk ──────────────────────────────────────────────
+            # Tells the agent what this source is so it can answer cross-source questions.
+            site_summary = extract_source_summary(source_id, first_content[:5000])
+            site_profile = (
+                f"SITE PROFILE: {source_id}\n"
+                f"Description: {site_summary}\n"
+                f"Total articles indexed: {len(set(all_urls))}\n"
+                f"Source URL: {url}"
+            )
+            all_urls.insert(0, url)
+            all_chunk_numbers.insert(0, 9998)
+            all_chunks.insert(0, site_profile)
+            all_metadatas.insert(0, {"source": url, "source_id": source_id, "type": "site_profile"})
 
-        # ── Homepage featured stories chunk ────────────────────────────────
-        # Uses real headline text extracted from homepage links.
-        if homepage_stories:
-            seen_titles: set[str] = set()
-            story_lines = [f"TOP STORIES currently featured on {source_id} homepage:\n"]
-            for story_url, headline in homepage_stories:
-                clean_headline = headline.strip()
-                if clean_headline.lower() not in seen_titles and len(clean_headline) > 15:
-                    seen_titles.add(clean_headline.lower())
-                    story_lines.append(f"- {clean_headline}  ({story_url})")
-            if len(story_lines) > 1:
-                featured_text = "\n".join(story_lines)
-                all_urls.insert(0, url)
-                all_chunk_numbers.insert(0, 9999)
-                all_chunks.insert(0, featured_text)
-                all_metadatas.insert(0, {"source": url, "source_id": source_id, "type": "featured_stories"})
-                url_to_full_doc[url] = url_to_full_doc.get(url, "") + "\n\n" + featured_text
+            # ── Homepage featured stories chunk ────────────────────────────────
+            # Uses real headline text extracted from homepage links.
+            if homepage_stories:
+                seen_titles: set[str] = set()
+                story_lines = [f"TOP STORIES currently featured on {source_id} homepage:\n"]
+                for story_url, headline in homepage_stories:
+                    clean_headline = headline.strip()
+                    if clean_headline.lower() not in seen_titles and len(clean_headline) > 15:
+                        seen_titles.add(clean_headline.lower())
+                        story_lines.append(f"- {clean_headline}  ({story_url})")
+                if len(story_lines) > 1:
+                    featured_text = "\n".join(story_lines)
+                    all_urls.insert(0, url)
+                    all_chunk_numbers.insert(0, 9999)
+                    all_chunks.insert(0, featured_text)
+                    all_metadatas.insert(0, {"source": url, "source_id": source_id, "type": "featured_stories"})
+                    url_to_full_doc[url] = url_to_full_doc.get(url, "") + "\n\n" + featured_text
 
-        # Store everything in Supabase
-        update_source_info(supabase, source_id, site_summary, total_words, url=url)
-        add_documents_to_supabase(
-            supabase, all_urls, all_chunk_numbers, all_chunks,
-            all_metadatas, url_to_full_doc,
-            skip_existing=is_recrawl,
-        )
-        set_next_crawl(supabase, source_id)
+            # Store everything in Supabase
+            update_source_info(supabase, source_id, site_summary, total_words, url=url)
+            add_documents_to_supabase(
+                supabase, all_urls, all_chunk_numbers, all_chunks,
+                all_metadatas, url_to_full_doc,
+                skip_existing=is_recrawl,
+            )
+            set_next_crawl(supabase, source_id)
 
-        print(f"[crawl] Done. {pages_crawled} pages, {len(all_chunks)} chunks stored.")
-        next_crawl_dt = datetime.now(timezone.utc) + timedelta(hours=RECRAWL_INTERVAL_HOURS)
-        next_crawl_str = next_crawl_dt.strftime("%Y-%m-%d %H:%M UTC")
-        return (
-            f"Successfully crawled **{source_id}**.\n\n"
-            f"- **{pages_crawled} page{'s' if pages_crawled != 1 else ''}** crawled"
-            f"{' (limit reached)' if pages_crawled >= max_pages else ''}\n"
-            f"- **{len(all_chunks)} chunks** stored\n"
-            f"- **{total_words:,} words** indexed\n"
-            f"- **Auto-recrawl** scheduled every {RECRAWL_INTERVAL_HOURS}h (next: {next_crawl_str})\n\n"
-            f"You can now ask questions about this content."
-        )
+            print(f"[crawl] Done. {pages_crawled} pages, {len(all_chunks)} chunks stored.")
+            next_crawl_dt = datetime.now(timezone.utc) + timedelta(hours=RECRAWL_INTERVAL_HOURS)
+            next_crawl_str = next_crawl_dt.strftime("%Y-%m-%d %H:%M UTC")
+            return (
+                f"Successfully crawled **{source_id}**.\n\n"
+                f"- **{pages_crawled} page{'s' if pages_crawled != 1 else ''}** crawled"
+                f"{' (limit reached)' if pages_crawled >= max_pages else ''}\n"
+                f"- **{len(all_chunks)} chunks** stored\n"
+                f"- **{total_words:,} words** indexed\n"
+                f"- **Auto-recrawl** scheduled every {RECRAWL_INTERVAL_HOURS}h (next: {next_crawl_str})\n\n"
+                f"You can now ask questions about this content."
+            )
 
-    except Exception as e:
-        print(f"[crawl] Error: {e}")
-        return f"Error crawling {url}: {str(e)}"
-    finally:
-        _crawling_sources.discard(source_id)
+        except Exception as e:
+            print(f"[crawl] Error: {e}")
+            return f"Error crawling {url}: {str(e)}"
+        finally:
+            _crawling_sources.discard(source_id)
 
 
 # ── RAG helpers ──
